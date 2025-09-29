@@ -1,0 +1,99 @@
+name: Verify NVRC Release
+
+on:
+  repository_dispatch:
+    types: [NVRC-verify]
+  workflow_run:
+    workflows: ["Release NVRC"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to verify (for example v1.2.3)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  verify-signatures:
+    if: ${{ github.event_name == 'repository_dispatch' || github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Install Rekor CLI and jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+          curl -sSLO https://github.com/sigstore/rekor/releases/download/v1.3.6/rekor-cli-linux-amd64
+          curl -sSLO https://github.com/sigstore/rekor/releases/download/v1.3.6/rekor-cli-linux-amd64.sha256
+          sha256sum -c rekor-cli-linux-amd64.sha256
+          chmod +x rekor-cli-linux-amd64
+          sudo mv rekor-cli-linux-amd64 /usr/local/bin/rekor-cli
+
+      - name: Install SLSA verifier
+        run: |
+          curl -sSLO https://github.com/slsa-framework/slsa-verifier/releases/download/v2.5.1/slsa-verifier-linux-amd64
+          curl -sSLO https://github.com/slsa-framework/slsa-verifier/releases/download/v2.5.1/slsa-verifier-linux-amd64.sha256
+          sha256sum -c slsa-verifier-linux-amd64.sha256
+          chmod +x slsa-verifier-linux-amd64
+          sudo mv slsa-verifier-linux-amd64 /usr/local/bin/slsa-verifier
+
+      - name: Resolve tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ] && [ -n "${{ github.event.client_payload.tag }}" ]; then
+            echo "tag=${{ github.event.client_payload.tag }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            t=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
+            echo "tag=$t" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "${{ steps.tag.outputs.tag }}" --repo "${{ github.repository }}" --dir .
+
+      - name: Verify binaries, checksums, signatures, Rekor, and SLSA provenance
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            echo "Verifying $target"
+            sha256sum -c "NVRC-${target}.sha256"
+            cosign verify-blob \
+              --rekor-url https://rekor.sigstore.dev \
+              --certificate "NVRC-${target}.cert" \
+              --signature "NVRC-${target}.sig" \
+              "NVRC-${target}"
+            prov=$(ls *.intoto.jsonl 2>/dev/null | xargs -r grep -l "NVRC-${target}" | head -n1 || true)
+            if [ -z "$prov" ]; then echo "No provenance JSONL found for $target"; exit 1; fi
+            slsa-verifier verify-artifact "NVRC-${target}" \
+              --provenance-path "$prov" \
+              --source-uri "github.com/${{ github.repository }}" \
+              --source-tag "${{ steps.tag.outputs.tag }}"
+          done
+
+      - name: Verify OCI artifacts and referrers in GHCR
+        run: |
+          set -euxo pipefail
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/NVRC:${{ steps.tag.outputs.tag }}-${target}"
+            cosign verify --rekor-url https://rekor.sigstore.dev "$REF"
+          done
