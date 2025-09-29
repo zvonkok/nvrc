@@ -1,0 +1,374 @@
+name: Release NVRC
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to Release"
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write # Required for OIDC authentication with Sigstore
+
+jobs:
+  build-and-release:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    outputs:
+      tag: ${{ steps.reltag.outputs.tag }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.85.1
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build (${{ matrix.target }})
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          export SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)
+          cargo build --release --target "${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/NVRC" "dist/NVRC-${{ matrix.target }}"
+
+      - name: Compute digest and checksum (sha256sum format)
+        id: hash
+        shell: bash
+        run: |
+          cd dist
+          # "<64-hex><space><space><filename>"
+          sha256sum "NVRC-${{ matrix.target }}" | tee "NVRC-${{ matrix.target }}.sha256"
+          # Keep a subjects file in sha256sum format; base64 is computed later when needed
+          cp "NVRC-${{ matrix.target }}.sha256" subjects.txt
+
+      - name: Generate SBOM (SPDX JSON)
+        uses: anchore/sbom-action@v0
+        with:
+          file: dist/NVRC-${{ matrix.target }}
+          format: spdx-json
+          output-file: dist/sbom-NVRC-${{ matrix.target }}.spdx.json
+          upload-artifact: false   # avoid matrix artifact name collisions (409)
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Keyless sign binary, checksum, and SBOM
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          # --- Cosign signing outputs ---
+          #   *.sig              → Detached signature over the artifact bytes
+          #   *.cert             → Fulcio X.509 cert binding an ephemeral key to this GH workflow identity
+          #   *.bundle.json      → Sigstore bundle with Rekor entry (SET/inclusion promise/proof + checkpoint)
+          # Notes:
+          #   • Keyless uses the GitHub OIDC token; Fulcio issues the cert; Rekor logs the signature.
+          #   • We pin identity during *verification* (see verify job). Signing does not take identity flags.
+          #   • We sign three things per target: the binary, its checksum file, and the SBOM.
+
+          # Sign binary (+ Rekor bundle)
+          cosign sign-blob --yes "dist/NVRC-${{ matrix.target }}" \
+            --output-signature "dist/NVRC-${{ matrix.target }}.sig" \
+            --output-certificate "dist/NVRC-${{ matrix.target }}.cert" \
+            --bundle "dist/NVRC-${{ matrix.target }}.bundle.json"
+
+          # Sign checksum file (+ Rekor bundle)
+          # Rationale: consumers can verify the checksum *file* itself is authentic before using it.
+          cosign sign-blob --yes "dist/NVRC-${{ matrix.target }}.sha256" \
+            --output-signature "dist/NVRC-${{ matrix.target }}.sha256.sig" \
+            --output-certificate "dist/NVRC-${{ matrix.target }}.sha256.cert" \
+            --bundle "dist/NVRC-${{ matrix.target }}.sha256.bundle.json"
+
+          # Sign SBOM (SPDX JSON) (+ Rekor bundle)
+          # Rationale: protects SBOM integrity; lets users pin supply-chain metadata to a signed artifact.
+          cosign sign-blob --yes "dist/sbom-NVRC-${{ matrix.target }}.spdx.json" \
+            --output-signature "dist/sbom-NVRC-${{ matrix.target }}.spdx.json.sig" \
+            --output-certificate "dist/sbom-NVRC-${{ matrix.target }}.spdx.json.cert" \
+            --bundle "dist/sbom-NVRC-${{ matrix.target }}.spdx.json.bundle.json"
+
+      - name: Upload dist as artifact (binary, SBOM, sigs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Determine release tag
+        id: reltag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.reltag.outputs.tag }}
+          name: Release ${{ steps.reltag.outputs.tag }}
+          files: |
+            dist/NVRC-${{ matrix.target }}
+            dist/NVRC-${{ matrix.target }}.sig
+            dist/NVRC-${{ matrix.target }}.cert
+            dist/NVRC-${{ matrix.target }}.sha256
+            dist/NVRC-${{ matrix.target }}.sha256.sig
+            dist/NVRC-${{ matrix.target }}.sha256.cert
+            dist/sbom-NVRC-${{ matrix.target }}.spdx.json
+            dist/sbom-NVRC-${{ matrix.target }}.spdx.json.sig
+            dist/sbom-NVRC-${{ matrix.target }}.spdx.json.cert
+            dist/NVRC-${{ matrix.target }}.bundle.json
+            dist/NVRC-${{ matrix.target }}.sha256.bundle.json
+            dist/sbom-NVRC-${{ matrix.target }}.spdx.json.bundle.json
+  # Compute ALL base64 subjects once and expose as a JSON map: { "<target>":"<b64>" }
+  provenance-hash-all:
+    needs: build-and-release
+    runs-on: ubuntu-24.04
+    outputs:
+      map: ${{ steps.mkmap.outputs.map }}
+    steps:
+      - name: Download x86_64 dist
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-x86_64-unknown-linux-musl
+          path: dist-x86
+      - name: Download aarch64 dist
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-aarch64-unknown-linux-musl
+          path: dist-arm
+      - name: Build target->base64 map
+        id: mkmap
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Use the sha256sum output we already produced (no re-hash)
+          X86_B64=$(cd dist-x86  && base64 -w0 NVRC-x86_64-unknown-linux-musl.sha256)
+          ARM_B64=$(cd dist-arm  && base64 -w0 NVRC-aarch64-unknown-linux-musl.sha256)
+          printf 'map={"x86_64-unknown-linux-musl":"%s","aarch64-unknown-linux-musl":"%s"}' "$X86_B64" "$ARM_B64" >> "$GITHUB_OUTPUT"
+
+  # Run the official SLSA generator per target
+  provenance:
+    needs: provenance-hash-all
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+          - target: aarch64-unknown-linux-musl
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: ${{ fromJSON(needs.provenance-hash-all.outputs.map)[matrix.target] }}
+      upload-assets: false # we'll upload with our own name in next job
+
+  # Rename provenance to include the tag and upload to the release
+  provenance-publish:
+    needs: [provenance, build-and-release]
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+          - target: aarch64-unknown-linux-musl
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download provenance artifact for this target
+        uses: actions/download-artifact@v4
+        with:
+          name: NVRC-${{ matrix.target }}.intoto.jsonl
+          path: prov
+      - name: Upload provenance to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.build-and-release.outputs.tag }}
+          files: prov/NVRC-${{ matrix.target }}.intoto.jsonl
+  verify-signatures:
+    needs: [provenance-publish, build-and-release]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Install Rekor CLI and jq
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq
+          # Rekor provides keyless cert+sig alongside the binary. Use gh to fetch the latest
+          # release assets for this runner's arch, then verify with cosign.
+          case "$(uname -m)" in
+            x86_64) ASSET=rekor-cli-linux-amd64 ;;
+            aarch64) ASSET=rekor-cli-linux-arm64 ;;
+            *) echo "Unsupported arch: $(uname -m)" >&2; exit 1 ;;
+          esac
+          # Download the binary from the latest release
+          gh release download --repo sigstore/rekor --pattern "${ASSET}" --dir . --clobber
+          # Try new keyless asset names first; fall back to older names if needed
+          if gh release download --repo sigstore/rekor --pattern "${ASSET}-keyless.pem" --pattern "${ASSET}-keyless.sig" --dir . --clobber; then
+            CERT="${ASSET}-keyless.pem"; SIG="${ASSET}-keyless.sig"
+          else
+            gh release download --repo sigstore/rekor --pattern "${ASSET}_cert.pem" --dir . --clobber
+            gh release download --repo sigstore/rekor --pattern "${ASSET}_signature.sig" --dir . --clobber
+            CERT="${ASSET}_cert.pem"; SIG="${ASSET}_signature.sig"
+          fi
+          # Verify the Rekor CLI binary with Cosign (Fulcio chain + Rekor proof)
+          # Pin to Sigstore's GitHub OIDC identity for the Rekor repo.
+          # We don't know the exact workflow file/ref ahead of time, so use an identity REGEXP
+          # scoped to sigstore/rekor workflows and require the GH OIDC issuer.
+          cosign verify-blob \
+            --certificate "$CERT" \
+            --signature   "$SIG" \
+            --certificate-identity-regexp "^https://github.com/sigstore/rekor/.github/workflows/.+@.+$" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            --certificate-github-workflow-repository "sigstore/rekor" \
+            "${ASSET}"
+          chmod +x "${ASSET}"
+          sudo mv "${ASSET}" /usr/local/bin/rekor-cli
+
+      - name: Install SLSA verifier
+        run: |
+          curl -sSLO https://github.com/slsa-framework/slsa-verifier/releases/download/v2.5.1/slsa-verifier-linux-amd64
+          curl -sSLO https://github.com/slsa-framework/slsa-verifier/releases/download/v2.5.1/slsa-verifier-linux-amd64.sha256
+          sha256sum -c slsa-verifier-linux-amd64.sha256
+          chmod +x slsa-verifier-linux-amd64
+          sudo mv slsa-verifier-linux-amd64 /usr/local/bin/slsa-verifier
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "${{ needs.build-and-release.outputs.tag }}" --repo "${{ github.repository }}" --dir .
+
+      - name: Verify binaries, checksums, SBOM signatures, Rekor, and SLSA provenance
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+
+          # Identity pinning cheatsheet (applies to both online and offline verifies):
+          #   --certificate-identity            → Exact Fulcio cert SAN (GitHub workflow ref)
+          #   --certificate-oidc-issuer        → OIDC issuer (GitHub Actions)
+          #   --certificate-github-workflow-*  → GH-specific claims embedded in the cert:
+          #        repository (owner/repo), ref (branch|tag), sha (commit),
+          #        name (workflow file), trigger (event)
+
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            echo "Verifying $target"
+
+            # 1) Check file hashes (content integrity)
+            sha256sum -c "NVRC-${target}.sha256"
+
+            # 2) ONLINE verification via Rekor transparency log
+            # 2a) Binary signature (keyless via Fulcio, must match our workflow identity)
+            cosign verify-blob \
+              --rekor-url https://rekor.sigstore.dev \
+              --certificate "NVRC-${target}.cert" \
+              --signature "NVRC-${target}.sig" \
+              --certificate-identity "https://github.com/${{ github.workflow_ref }}" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              --certificate-github-workflow-repository "${{ github.repository }}" \
+              --certificate-github-workflow-ref "${{ github.ref }}" \
+              --certificate-github-workflow-sha "${{ github.sha }}" \
+              --certificate-github-workflow-name "${{ github.workflow }}" \
+              --certificate-github-workflow-trigger "${{ github.event_name }}" \
+              "NVRC-${target}"
+
+            # 2b) Checksum file signature (pins identity same as above)
+            cosign verify-blob \
+              --rekor-url https://rekor.sigstore.dev \
+              --certificate "NVRC-${target}.sha256.cert" \
+              --signature "NVRC-${target}.sha256.sig" \
+              --certificate-identity "https://github.com/${{ github.workflow_ref }}" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              --certificate-github-workflow-repository "${{ github.repository }}" \
+              --certificate-github-workflow-ref "${{ github.ref }}" \
+              --certificate-github-workflow-sha "${{ github.sha }}" \
+              --certificate-github-workflow-name "${{ github.workflow }}" \
+              --certificate-github-workflow-trigger "${{ github.event_name }}" \
+              "NVRC-${target}.sha256"
+
+            # 2c) SBOM signature (pins identity same as above)
+            cosign verify-blob \
+              --rekor-url https://rekor.sigstore.dev \
+              --certificate "sbom-NVRC-${target}.spdx.json.cert" \
+              --signature   "sbom-NVRC-${target}.spdx.json.sig" \
+              --certificate-identity "https://github.com/${{ github.workflow_ref }}" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              --certificate-github-workflow-repository "${{ github.repository }}" \
+              --certificate-github-workflow-ref "${{ github.ref }}" \
+              --certificate-github-workflow-sha "${{ github.sha }}" \
+              --certificate-github-workflow-name "${{ github.workflow }}" \
+              --certificate-github-workflow-trigger "${{ github.event_name }}" \
+              "sbom-NVRC-${target}.spdx.json"
+
+            # 3) OFFLINE verification using Sigstore bundles (no network, with TLOG proofs)
+            #    The same identity pins are checked against the certificate embedded in the bundle.
+            cosign verify-blob --bundle "NVRC-${target}.bundle.json" \
+              --certificate-identity "https://github.com/${{ github.workflow_ref }}" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              --certificate-github-workflow-repository "${{ github.repository }}" \
+              --certificate-github-workflow-ref "${{ github.ref }}" \
+              --certificate-github-workflow-sha "${{ github.sha }}" \
+              --certificate-github-workflow-name "${{ github.workflow }}" \
+              --certificate-github-workflow-trigger "${{ github.event_name }}" \
+              "NVRC-${target}"
+
+            cosign verify-blob --bundle "NVRC-${target}.sha256.bundle.json" \
+              --certificate-identity "https://github.com/${{ github.workflow_ref }}" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              --certificate-github-workflow-repository "${{ github.repository }}" \
+              --certificate-github-workflow-ref "${{ github.ref }}" \
+              --certificate-github-workflow-sha "${{ github.sha }}" \
+              --certificate-github-workflow-name "${{ github.workflow }}" \
+              --certificate-github-workflow-trigger "${{ github.event_name }}" \
+              "NVRC-${target}.sha256"
+
+            cosign verify-blob --bundle "sbom-NVRC-${target}.spdx.json.bundle.json" \
+              --certificate-identity "https://github.com/${{ github.workflow_ref }}" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              --certificate-github-workflow-repository "${{ github.repository }}" \
+              --certificate-github-workflow-ref "${{ github.ref }}" \
+              --certificate-github-workflow-sha "${{ github.sha }}" \
+              --certificate-github-workflow-name "${{ github.workflow }}" \
+              --certificate-github-workflow-trigger "${{ github.event_name }}" \
+              "sbom-NVRC-${target}.spdx.json"
+
+            # 4) Verify SLSA provenance
+            #    slsa-verifier checks the DSSE envelope against the artifact and the source (repo+tag).
+            #    We locate the per-target provenance file by name; fallback to grepping its contents.
+            prov=$(ls NVRC-${target}.intoto.jsonl 2>/dev/null || true)
+            if [ -z "$prov" ]; then
+              prov=$(grep -l "NVRC-${target}" ./*.intoto.jsonl | head -n1 || true)
+            fi
+            if [ -z "$prov" ]; then echo "No provenance JSONL found for $target"; exit 1; fi
+
+            slsa-verifier verify-artifact "NVRC-${target}" \
+              --provenance-path "$prov" \
+              --source-uri "github.com/${{ github.repository }}" \
+              --source-tag "${{ needs.build-and-release.outputs.tag }}"
+          done
