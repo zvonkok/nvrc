@@ -3,7 +3,12 @@
 
 //! NVRC configuration state and daemon lifecycle management.
 
-use anyhow::{anyhow, Result};
+extern crate alloc;
+
+use crate::anyhow;
+use crate::error::Result;
+use alloc::string::String;
+use alloc::vec::Vec;
 use hardened_std::process::Child;
 
 /// Central configuration state for the NVIDIA Runtime Container init.

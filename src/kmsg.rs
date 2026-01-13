@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) NVIDIA CORPORATION
 
-use anyhow::{Context, Result};
-use hardened_std::fs::{self, File, OpenOptions};
-use once_cell::sync::OnceCell;
+extern crate alloc;
 
-static KERNLOG_INIT: OnceCell<()> = OnceCell::new();
+use alloc::boxed::Box;
+use alloc::format;
+use crate::error::{Context, Result};
+use hardened_std::fs::{self, File, OpenOptions};
+use once_cell::race::OnceBox;
+
+static KERNLOG_INIT: OnceBox<()> = OnceBox::new();
 
 /// Socket buffer size (16MB = 16 * 1024 * 1024 = 16777216 bytes).
 /// Large buffers prevent message loss during high-throughput GPU operations
@@ -17,7 +21,8 @@ const SOCKET_BUFFER_SIZE: &str = "16777216";
 /// where drivers may emit bursts of diagnostic data.
 pub fn kernlog_setup() -> Result<()> {
     KERNLOG_INIT.get_or_init(|| {
-        let _ = kernlog::init();
+        let _ = hardened_std::kernlog::init();
+        Box::new(())
     });
     log::set_max_level(log::LevelFilter::Off);
     for path in [

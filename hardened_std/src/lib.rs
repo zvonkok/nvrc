@@ -10,13 +10,15 @@
 
 extern crate alloc;
 
-// For tests and std-support feature, we need std
-#[cfg(any(test, feature = "std-support"))]
+// std only needed for tests
+#[cfg(test)]
 extern crate std;
 
 pub mod collections;
 pub mod fs;
+pub mod kernlog;
 pub mod os;
+pub mod panic;
 pub mod path;
 pub mod process;
 
@@ -54,9 +56,8 @@ impl fmt::Display for Error {
     }
 }
 
-// Implement std::error::Error when std is available.
-// This enables anyhow's .context() to work with hardened_std::Error.
-#[cfg(any(test, feature = "std-support"))]
+// Implement std::error::Error for tests only
+#[cfg(test)]
 impl std::error::Error for Error {}
 
 impl Error {

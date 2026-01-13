@@ -1,4 +1,7 @@
-use anyhow::{Context, Result};
+extern crate alloc;
+
+use crate::error::{Context, Result};
+use alloc::borrow::ToOwned;
 use hardened_std::fs;
 use log::{debug, warn};
 
@@ -145,7 +148,7 @@ mod tests {
 
     fn log_setup() {
         LOG.call_once(|| {
-            kernlog::init().unwrap();
+            let _ = hardened_std::kernlog::init();
         });
     }
 

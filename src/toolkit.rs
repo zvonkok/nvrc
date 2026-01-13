@@ -6,8 +6,8 @@
 //! Generates CDI (Container Device Interface) specs so container runtimes
 //! can discover and mount GPU devices without needing the legacy hook.
 
+use crate::error::Result;
 use crate::execute::foreground;
-use anyhow::Result;
 
 const NVIDIA_CTK: &str = "/bin/nvidia-ctk";
 

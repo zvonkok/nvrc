@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) NVIDIA CORPORATION
 
-use anyhow::{Context, Result};
+extern crate alloc;
+
+use crate::error::{Context, Result};
+use alloc::vec;
+use alloc::vec::Vec;
 use hardened_std::fs;
 
 use crate::execute::background;

@@ -2,11 +2,20 @@
 // Copyright (c) NVIDIA CORPORATION
 
 //! Library interface for fuzzing and testing.
-
-#![allow(non_snake_case)]
 //! The main binary uses these modules internally.
+//!
+//! Uses hardened_std for security-restricted operations throughout.
+
+#![cfg_attr(not(test), no_std)]
+#![allow(non_snake_case)]
+
+extern crate alloc;
+
+#[cfg(test)]
+extern crate std;
 
 pub mod daemon;
+pub mod error;
 pub mod execute;
 pub mod kata_agent;
 pub mod kernel_params;
@@ -26,4 +35,3 @@ pub mod test_utils;
 
 #[macro_use]
 extern crate log;
-extern crate kernlog;

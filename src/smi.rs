@@ -3,9 +3,12 @@
 //! These functions apply GPU settings via nvidia-smi before workloads run.
 //! All are optional—if the kernel param isn't set, they return Ok immediately.
 
+extern crate alloc;
+
+use crate::error::Result;
 use crate::execute::foreground;
 use crate::nvrc::NVRC;
-use anyhow::Result;
+use alloc::string::ToString;
 
 const NVIDIA_SMI: &str = "/bin/nvidia-smi";
 

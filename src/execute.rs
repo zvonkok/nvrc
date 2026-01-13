@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) NVIDIA CORPORATION
 
-use anyhow::{anyhow, Context, Result};
+extern crate alloc;
+
+use crate::anyhow;
+use crate::error::{Context, Result};
 use hardened_std::process::{Child, Command, Stdio};
 
 use crate::kmsg::kmsg;

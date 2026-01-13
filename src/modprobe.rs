@@ -1,5 +1,5 @@
+use crate::error::Result;
 use crate::execute::foreground;
-use anyhow::Result;
 
 const MODPROBE: &str = "/sbin/modprobe";
 

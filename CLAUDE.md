@@ -27,16 +27,17 @@ enables:
 3. [done] `hardened_std::os::unix::net` - Unix sockets with path whitelisting
 4. [done] Replace `std::sync::Once` with `once_cell` (no_std compatible)
 5. [done] `hardened_std::fs::exists()` - Replace `std::path::Path::exists()`
-6. [todo] Replace `std::panic` hook setup (may need custom impl)
-7. [todo] Replace `std::os::fd::AsFd` (needed for nix poll integration)
+6. [done] `hardened_std::panic` - Panic hook and power_off for VM shutdown
+7. [done] Implement `std::os::fd::AsFd` for hardened types (nix poll integration)
 8. [todo] Audit all dependencies for no_std compatibility
 
 **Dependencies no_std status:**
 
 - `anyhow` - yes, supports no_std (disable default features)
 - `log` - yes, supports no_std
-- `nix` - no, requires std (may need direct syscalls)
+- `nix` - REMOVED, replaced with direct libc syscalls
 - `once_cell` - yes, supports no_std
+- `kernlog` - no, requires std (may need replacement)
 - `rlimit` - needs investigation
 
 ## hardened_std

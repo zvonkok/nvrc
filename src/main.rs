@@ -1,7 +1,82 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) NVIDIA CORPORATION
 
+//! NVRC init binary - minimal init process for GPU-enabled confidential VMs.
+//!
+//! This is a #![no_std] binary that uses hardened_std for all security-restricted
+//! operations. On panic, the VM is powered off to prevent undefined state.
+
+#![no_std]
+#![no_main]
+
+extern crate alloc;
+
+use core::panic::PanicInfo;
+
+/// Panic handler - powers off the VM on panic.
+/// In a confidential VM, a panic could leave the system in an undefined state
+/// with potential data exposure. Power-off ensures clean termination.
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    // Write panic info to stderr via direct libc
+    let prefix = b"NVRC panic: ";
+    unsafe {
+        libc::write(
+            libc::STDERR_FILENO,
+            prefix.as_ptr() as *const libc::c_void,
+            prefix.len(),
+        );
+    }
+
+    // Write location if available
+    if let Some(location) = info.location() {
+        let file = location.file();
+        let line = location.line();
+
+        unsafe {
+            libc::write(
+                libc::STDERR_FILENO,
+                file.as_ptr() as *const libc::c_void,
+                file.len(),
+            );
+            libc::write(libc::STDERR_FILENO, b":".as_ptr() as *const libc::c_void, 1);
+        }
+
+        // Format line number
+        let mut line_buf = [0u8; 10];
+        let line_str = hardened_std::panic::format_u32(line, &mut line_buf);
+        unsafe {
+            libc::write(
+                libc::STDERR_FILENO,
+                line_str.as_ptr() as *const libc::c_void,
+                line_str.len(),
+            );
+            libc::write(libc::STDERR_FILENO, b"\n".as_ptr() as *const libc::c_void, 1);
+        }
+    }
+
+    // Sync and power off
+    hardened_std::panic::power_off()
+}
+
+/// Global allocator using libc malloc/free
+struct LibcAllocator;
+
+unsafe impl core::alloc::GlobalAlloc for LibcAllocator {
+    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        libc::memalign(layout.align(), layout.size()) as *mut u8
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, _layout: core::alloc::Layout) {
+        libc::free(ptr as *mut libc::c_void)
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: LibcAllocator = LibcAllocator;
+
 mod daemon;
+mod error;
 mod execute;
 mod kata_agent;
 mod kernel_params;
@@ -21,7 +96,6 @@ mod test_utils;
 
 #[macro_use]
 extern crate log;
-extern crate kernlog;
 
 use hardened_std::collections::HashMap;
 
@@ -80,7 +154,9 @@ fn mode_nvswitch_nvl5(init: &mut NVRC) {
     must!(init.check_daemons());
 }
 
-fn main() {
+/// Entry point - called by C runtime startup code
+#[no_mangle]
+pub extern "C" fn main(_argc: isize, _argv: *const *const u8) -> isize {
     // Dispatch table allows adding new modes without touching control flow.
     let modes: HashMap<&str, ModeFn> = HashMap::from([
         ("gpu", mode_gpu as ModeFn),
@@ -105,4 +181,5 @@ fn main() {
 
     must!(lockdown::disable_modules_loading());
     must!(kata_agent::fork_agent(POLL_FOREVER));
+    0
 }

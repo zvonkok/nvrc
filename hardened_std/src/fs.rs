@@ -6,14 +6,6 @@
 use crate::{last_os_error, Error, Result};
 use alloc::string::ToString;
 
-// Type aliases for std types when std-support feature is enabled
-#[cfg(feature = "std-support")]
-use std::fs::File as StdFile;
-#[cfg(feature = "std-support")]
-use std::os::unix::io::FromRawFd;
-#[cfg(feature = "std-support")]
-use std::process::Stdio as StdStdio;
-
 /// Maximum bytes allowed in a single write operation.
 ///
 /// **Security Constraint:**
@@ -547,61 +539,11 @@ impl File {
         self.fd
     }
 
-    /// Convert File into std::process::Stdio safely.
+    /// Convert File into raw file descriptor, consuming ownership.
     ///
-    /// **Security Design:**
-    /// This method provides a safe alternative to exposing raw file descriptors.
-    /// By converting directly to Stdio, we maintain ownership tracking and
-    /// automatic cleanup through Rust's type system, preventing fd leaks.
-    ///
-    /// **Why this is safe:**
-    /// - No raw fd exposure - fd stays managed by Rust types
-    /// - Automatic cleanup - Stdio's Drop will close the fd
-    /// - No manual close() needed - prevents use-after-free bugs
-    /// - No double-free possible - ownership transfer is type-safe
-    ///
-    /// **Usage in NVRC:**
-    /// ```ignore
-    /// // execute.rs - Safe fd transfer for process stdout/stderr
-    /// let kmsg = hardened_std::fs::File::open("/dev/kmsg")?;
-    /// let stdio = kmsg.into_stdio();
-    /// Command::new("nvidia-smi").stdout(stdio).spawn()?;
-    /// // fd automatically closed when Command/Stdio drops - NO LEAKS!
-    /// ```
-    ///
-    /// This is only available when compiling with std-support feature.
-    #[cfg(feature = "std-support")]
-    pub fn into_stdio(self) -> StdStdio {
-        use core::mem::ManuallyDrop;
-
-        // Use ManuallyDrop for explicit ownership transfer semantics
-        // This is safer than mem::forget if panic occurs during conversion
-        let manual = ManuallyDrop::new(self);
-        let fd = manual.fd;
-
-        // SAFETY: Safe ownership transfer because:
-        // 1. fd is valid - came from successful open()
-        // 2. We have unique ownership - self is wrapped in ManuallyDrop
-        // 3. std::fs::File takes ownership - will close on drop
-        // 4. No double-close - ManuallyDrop prevents our Drop from running
-        // 5. Even if panic occurs, ManuallyDrop ensures no double-free
-        let std_file = unsafe { StdFile::from_raw_fd(fd) };
-        StdStdio::from(std_file)
-    }
-
-    /// Convert File into raw file descriptor for interop (INTERNAL USE ONLY).
-    ///
-    /// **DANGER:** This method breaks hardened_std's security model!
-    /// Only use this for interfacing with trusted libraries where there's
-    /// no safe alternative. The caller becomes responsible for fd cleanup.
-    ///
-    /// **DO NOT USE** unless you absolutely need raw fd access.
-    /// Prefer `into_stdio()` for Command/process use cases.
-    ///
-    /// # Safety Requirements
-    /// 1. MUST close the fd manually via libc::close() or from_raw_fd()
-    /// 2. Failure to close causes resource leaks in PID 1 init process
-    /// 3. Double-close causes undefined behavior
+    /// Used internally by hardened_std::process::Stdio::from(File) for
+    /// redirecting command stdout/stderr. The caller takes ownership of
+    /// the fd and is responsible for closing it.
     pub(crate) fn into_raw_fd(self) -> i32 {
         let fd = self.fd;
         core::mem::forget(self);

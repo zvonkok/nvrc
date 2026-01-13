@@ -179,17 +179,6 @@ impl crate::os::fd::AsFd for UnixDatagram {
     }
 }
 
-/// Implement std::os::fd::AsFd when std-support is enabled.
-/// This allows using hardened_std::UnixDatagram with nix::poll::PollFd.
-#[cfg(feature = "std-support")]
-impl std::os::fd::AsFd for UnixDatagram {
-    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        // SAFETY: self.fd is a valid file descriptor owned by this UnixDatagram.
-        // The BorrowedFd's lifetime is tied to &self, ensuring the fd remains valid.
-        unsafe { std::os::fd::BorrowedFd::borrow_raw(self.fd) }
-    }
-}
-
 /// Socket address for Unix domain sockets (opaque marker type).
 pub struct SocketAddr {
     _addr: libc::sockaddr_un,

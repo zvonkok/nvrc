@@ -3,7 +3,6 @@
 
 //! Shared test utilities. Only compiled during tests.
 
-use nix::unistd::Uid;
 use std::env;
 use std::process::Command;
 
@@ -16,7 +15,9 @@ use std::process::Command;
 /// Normal test builds: Re-executes the test binary via sudo, then exits with
 /// the child's exit code. This allows `cargo test` to work without sudo.
 pub fn require_root() {
-    require_root_impl(Uid::effective().is_root())
+    // SAFETY: geteuid() is always safe
+    let is_root = unsafe { libc::geteuid() } == 0;
+    require_root_impl(is_root)
 }
 
 /// Internal: testable implementation with injected root status.

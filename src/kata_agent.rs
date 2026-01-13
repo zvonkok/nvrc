@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) NVIDIA CORPORATION
 
-use anyhow::{anyhow, Context, Result};
+extern crate alloc;
+
+use crate::anyhow;
+use crate::error::{Context, Result};
 use hardened_std::fs;
 use hardened_std::process::Command;
 use log::{debug, error};
-use nix::unistd::{fork, ForkResult};
-use rlimit::{setrlimit, Resource};
 
 const KATA_AGENT_PATH: &str = "/usr/bin/kata-agent";
 
@@ -20,14 +21,44 @@ pub const SYSLOG_POLL_FOREVER: u32 = u32::MAX;
 /// (never kill) to 1000 (always kill first).
 const OOM_SCORE_ADJ: &str = "-997";
 
+/// Set resource limit using direct libc call.
+fn setrlimit(resource: libc::__rlimit_resource_t, soft: u64, hard: u64) -> Result<()> {
+    let rlim = libc::rlimit {
+        rlim_cur: soft as libc::rlim_t,
+        rlim_max: hard as libc::rlim_t,
+    };
+    // SAFETY: setrlimit with valid rlimit struct is safe
+    let ret = unsafe { libc::setrlimit(resource, &rlim) };
+    if ret != 0 {
+        let errno = unsafe { *libc::__errno_location() };
+        return Err(anyhow!("setrlimit failed: errno {}", errno));
+    }
+    Ok(())
+}
+
+/// Get resource limit using direct libc call.
+fn getrlimit(resource: libc::__rlimit_resource_t) -> Result<(u64, u64)> {
+    let mut rlim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit with valid rlimit pointer is safe
+    let ret = unsafe { libc::getrlimit(resource, &mut rlim) };
+    if ret != 0 {
+        let errno = unsafe { *libc::__errno_location() };
+        return Err(anyhow!("getrlimit failed: errno {}", errno));
+    }
+    Ok((rlim.rlim_cur, rlim.rlim_max))
+}
+
 /// kata-agent needs high file descriptor limits for container workloads and
 /// must survive OOM conditions to maintain VM stability
 fn agent_setup() -> Result<()> {
     let nofile = 1024 * 1024;
-    setrlimit(Resource::NOFILE, nofile, nofile).context("setrlimit RLIMIT_NOFILE")?;
+    setrlimit(libc::RLIMIT_NOFILE as _, nofile, nofile).context("setrlimit RLIMIT_NOFILE")?;
     fs::write("/proc/self/oom_score_adj", OOM_SCORE_ADJ.as_bytes())
         .context("write /proc/self/oom_score_adj")?;
-    let lim = rlimit::getrlimit(Resource::NOFILE)?;
+    let lim = getrlimit(libc::RLIMIT_NOFILE as _)?;
     debug!("kata-agent RLIMIT_NOFILE: {:?}", lim);
     Ok(())
 }
@@ -68,24 +99,33 @@ pub fn fork_agent(timeout_secs: u32) -> Result<()> {
     // 2. Parent immediately execs kata-agent (no shared state issues)
     // 3. Child only calls async-signal-safe functions (poll syscall)
     // 4. No locks or mutexes exist that could deadlock in child
-    match unsafe { fork() }.expect("fork agent") {
-        ForkResult::Parent { .. } => {
-            kata_agent(KATA_AGENT_PATH).context("kata-agent parent")?;
+    let pid = unsafe { libc::fork() };
+
+    match pid {
+        -1 => {
+            // Fork failed
+            let errno = unsafe { *libc::__errno_location() };
+            Err(anyhow!("fork failed: errno {}", errno))
         }
-        ForkResult::Child => {
+        0 => {
+            // Child process - syslog poller
             if let Err(e) = syslog_loop(timeout_secs) {
                 error!("{e}");
             }
+            Ok(())
+        }
+        _ => {
+            // Parent process - becomes kata-agent
+            kata_agent(KATA_AGENT_PATH).context("kata-agent parent")?;
+            Ok(())
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_utils::require_root;
-    use nix::sys::wait::{waitpid, WaitStatus};
 
     #[test]
     fn test_agent_setup() {
@@ -96,7 +136,7 @@ mod tests {
         assert!(result.is_ok(), "agent_setup failed: {:?}", result);
 
         // Verify rlimit was set
-        let (soft, hard) = rlimit::getrlimit(Resource::NOFILE).unwrap();
+        let (soft, hard) = getrlimit(libc::RLIMIT_NOFILE as _).unwrap();
         assert_eq!(soft, 1024 * 1024);
         assert_eq!(hard, 1024 * 1024);
 
@@ -121,17 +161,20 @@ mod tests {
         // kata_agent with nonexistent path - setup succeeds, exec fails
         // SAFETY: Test forks to isolate agent_setup() and exec failure.
         // Single-threaded test process with no shared state.
-        match unsafe { fork() }.expect("fork") {
-            ForkResult::Parent { child } => {
-                assert!(matches!(
-                    waitpid(child, None).expect("waitpid"),
-                    WaitStatus::Exited(_, 1)
-                ));
-            }
-            ForkResult::Child => {
-                // Setup succeeds, exec fails - verify and exit with expected code
+        let pid = unsafe { libc::fork() };
+        match pid {
+            -1 => panic!("fork failed"),
+            0 => {
+                // Child: Setup succeeds, exec fails - verify and exit with expected code
                 assert!(kata_agent("/nonexistent/agent").is_err());
                 std::process::exit(1);
+            }
+            child_pid => {
+                // Parent: wait for child
+                let mut status: libc::c_int = 0;
+                unsafe { libc::waitpid(child_pid, &mut status, 0) };
+                assert!(libc::WIFEXITED(status));
+                assert_eq!(libc::WEXITSTATUS(status), 1);
             }
         }
     }
@@ -165,21 +208,23 @@ mod tests {
         // does the real work. This lets us actually call fork_agent_with_timeout() directly.
         // SAFETY: Outer fork isolates the test in a child process.
         // Single-threaded test with no shared state.
-        match unsafe { fork() }.expect("outer fork") {
-            ForkResult::Parent { child } => {
-                // Wrapper exits 1 because kata_agent() fails (no binary)
-                assert!(matches!(
-                    waitpid(child, None).expect("waitpid"),
-                    WaitStatus::Exited(_, 1)
-                ));
-            }
-            ForkResult::Child => {
-                // This child calls fork_agent_with_timeout, which forks again internally.
+        let pid = unsafe { libc::fork() };
+        match pid {
+            -1 => panic!("fork failed"),
+            0 => {
+                // Child: This child calls fork_agent, which forks again internally.
                 // - Inner parent (us): kata_agent() fails, returns Err
                 // - Inner child: runs syslog_loop(1), exits after ~1 second
                 let result = fork_agent(1);
                 // We're the inner parent, so we get the error from kata_agent()
                 std::process::exit(if result.is_err() { 1 } else { 0 });
+            }
+            child_pid => {
+                // Parent: Wrapper exits 1 because kata_agent() fails (no binary)
+                let mut status: libc::c_int = 0;
+                unsafe { libc::waitpid(child_pid, &mut status, 0) };
+                assert!(libc::WIFEXITED(status));
+                assert_eq!(libc::WEXITSTATUS(status), 1);
             }
         }
     }

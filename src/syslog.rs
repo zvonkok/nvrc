@@ -7,15 +7,18 @@
 //! this socket and forward messages to the kernel log via trace!(). Severity
 //! levels are stripped since all messages go to the same destination anyway.
 
+extern crate alloc;
+
+use alloc::boxed::Box;
+use alloc::string::String;
+use hardened_std::os::fd::AsFd;
 use hardened_std::os::unix::net::UnixDatagram;
 use hardened_std::{Error, Result};
 use log::trace;
-use nix::poll::{PollFd, PollFlags, PollTimeout};
-use once_cell::sync::OnceCell;
-use std::os::fd::AsFd;
+use once_cell::race::OnceBox;
 
 /// Global syslog socket—lazily initialized on first poll().
-static SYSLOG: OnceCell<UnixDatagram> = OnceCell::new();
+static SYSLOG: OnceBox<UnixDatagram> = OnceBox::new();
 
 const DEV_LOG: &str = "/dev/log";
 
@@ -29,35 +32,33 @@ pub fn poll() -> Result<()> {
 /// Poll with timeout (milliseconds). Blocks until data arrives or timeout.
 /// Returns Ok(true) if a message was processed, Ok(false) on timeout.
 ///
-/// **Timeout limits:** Values are clamped to 65535ms (~65s). Negative values
-/// block indefinitely. For production 500ms polling, this is not a concern.
+/// **Timeout limits:** Negative values block indefinitely.
+/// For production 500ms polling, this is not a concern.
 pub fn poll_timeout(timeout_ms: i32) -> Result<bool> {
-    let sock = SYSLOG.get_or_try_init(|| UnixDatagram::bind(DEV_LOG))?;
+    let sock = SYSLOG.get_or_try_init(|| UnixDatagram::bind(DEV_LOG).map(Box::new))?;
     poll_socket_timeout(sock, timeout_ms)
 }
 
 /// Poll socket with timeout. Returns Ok(true) if message read, Ok(false) on timeout.
 fn poll_socket_timeout(sock: &UnixDatagram, timeout_ms: i32) -> Result<bool> {
-    let mut fds = [PollFd::new(sock.as_fd(), PollFlags::POLLIN)];
-    let timeout = if timeout_ms < 0 {
-        PollTimeout::NONE
-    } else {
-        let ms = (timeout_ms as u32).min(u16::MAX as u32) as u16;
-        PollTimeout::from(ms)
+    let mut pfd = libc::pollfd {
+        fd: sock.as_fd(),
+        events: libc::POLLIN,
+        revents: 0,
     };
 
-    // nix::Errno is #[repr(i32)] so `as i32` extracts the raw errno value
-    let count = nix::poll::poll(&mut fds, timeout).map_err(|e| Error::Io(e as i32))?;
+    // SAFETY: poll() with valid pollfd struct is safe
+    let count = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+
+    if count < 0 {
+        return Err(Error::Io(unsafe { *libc::__errno_location() }));
+    }
 
     if count == 0 {
         return Ok(false);
     }
 
-    let Some(revents) = fds[0].revents() else {
-        return Ok(false);
-    };
-
-    if !revents.contains(PollFlags::POLLIN) {
+    if (pfd.revents & libc::POLLIN) == 0 {
         return Ok(false);
     }
 

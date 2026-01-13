@@ -6,11 +6,7 @@ license = "Apache-2.0"
 
 [dependencies]
 libc = { version = "0.2", default-features = false }
-
-[features]
-# Enable std support for safe Stdio conversion
-# This is automatically enabled when building NVRC binary
-std-support = []
+log = { version = "0.4", default-features = false }
 
 [lib]
 name = "hardened_std"

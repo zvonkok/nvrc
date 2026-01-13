@@ -3,38 +3,20 @@
 
 //! Lockdown primitives for confidential VM security.
 //!
-//! In production, panic triggers VM power-off. For tests, the shutdown
-//! action is configurable via `set_panic_hook_with()`.
+//! In production with #![no_std], the #[panic_handler] in main.rs handles
+//! panics by powering off the VM. This module provides module loading lockdown.
 
-use anyhow::{Context, Result};
+use crate::error::{Context, Result};
 use hardened_std::fs;
-use nix::sys::reboot::{reboot, RebootMode};
-use nix::unistd::sync;
-use std::panic;
 
-/// Default shutdown action: power off the VM.
-fn power_off() {
-    let _ = reboot(RebootMode::RB_POWER_OFF);
-}
+#[cfg(test)]
+use hardened_std::panic as hardened_panic;
 
-/// Install a panic handler that powers off the VM instead of unwinding.
-/// In a confidential VM, a panic could leave the system in an undefined state
-/// with potential data exposure. Power-off ensures clean termination—the host
-/// hypervisor will see the VM exit and can handle cleanup appropriately.
-/// sync() flushes pending writes before power-off to preserve any logs.
+/// Placeholder for panic hook setup - actual handling done by #[panic_handler].
+/// Returns Ok(()) for compatibility with existing call sites.
 pub fn set_panic_hook() -> Result<()> {
-    set_panic_hook_with(power_off)
-}
-
-/// Internal: panic handler with configurable shutdown (for unit tests).
-/// Production uses power_off(); tests inject a no-op to avoid rebooting.
-fn set_panic_hook_with<F: Fn() + Send + Sync + 'static>(shutdown: F) -> Result<()> {
-    panic::set_hook(Box::new(move |panic_info| {
-        // fd 1,2 are always available from the kernel
-        eprintln!("panic: {panic_info}");
-        sync();
-        shutdown();
-    }));
+    // In no_std mode, panic handling is done by #[panic_handler] in main.rs
+    // This function exists for API compatibility during the transition
     Ok(())
 }
 
@@ -52,23 +34,6 @@ pub fn disable_modules_loading() -> Result<()> {
 mod tests {
     use super::*;
     use crate::test_utils::require_root;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-
-    #[test]
-    fn test_set_panic_hook_with_custom_action() {
-        let called = Arc::new(AtomicBool::new(false));
-        let called_clone = called.clone();
-
-        // Install hook with test closure
-        let _ = set_panic_hook_with(move || {
-            called_clone.store(true, Ordering::SeqCst);
-        });
-
-        // The hook is installed - we can't trigger it without panicking,
-        // but we've exercised the code path
-        assert!(!called.load(Ordering::SeqCst)); // Not called yet
-    }
 
     #[test]
     #[ignore] // DANGEROUS: permanently disables module loading until reboot - only run in ephemeral VMs
@@ -88,14 +53,13 @@ mod tests {
     #[test]
     fn test_power_off_function_exists() {
         // Just verify power_off compiles - can't call it without rebooting!
-        let _: fn() = power_off;
+        let _: fn() -> ! = hardened_panic::power_off;
     }
 
     #[test]
-    #[ignore] // DANGEROUS: installs real power_off hook - any subsequent panic reboots the system
     fn test_set_panic_hook() {
-        // Installs the real hook (with power_off) - just don't trigger it!
-        let _ = set_panic_hook();
-        // If we got here, the hook was installed successfully
+        // In no_std mode, this is a no-op placeholder
+        let result = set_panic_hook();
+        assert!(result.is_ok());
     }
 }

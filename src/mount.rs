@@ -3,29 +3,85 @@
 
 //! Filesystem setup for the minimal init environment.
 
-use anyhow::{Context, Result};
+extern crate alloc;
+
+use crate::anyhow;
+use crate::error::{Context, Result};
+use alloc::ffi::CString;
+use alloc::format;
 use hardened_std::fs;
-use nix::mount::MsFlags;
+
+/// Mount flags - subset of MS_* flags we actually use
+mod flags {
+    pub const MS_NOSUID: libc::c_ulong = 2;
+    pub const MS_NODEV: libc::c_ulong = 4;
+    pub const MS_NOEXEC: libc::c_ulong = 8;
+    pub const MS_REMOUNT: libc::c_ulong = 32;
+    pub const MS_RELATIME: libc::c_ulong = 1 << 21;
+    pub const MS_RDONLY: libc::c_ulong = 1;
+}
 
 /// Mount a filesystem. Errors if mount fails.
 fn mount(
     source: &str,
     target: &str,
     fstype: &str,
-    flags: MsFlags,
+    flags: libc::c_ulong,
     data: Option<&str>,
 ) -> Result<()> {
-    nix::mount::mount(Some(source), target, Some(fstype), flags, data)
-        .with_context(|| format!("mount {source} on {target}"))
+    // Convert strings to C strings (null-terminated)
+    let source_cstr = CString::new(source).unwrap();
+    let target_cstr = CString::new(target).unwrap();
+    let fstype_cstr = CString::new(fstype).unwrap();
+    let data_cstr = data.map(|d| CString::new(d).unwrap());
+
+    let data_ptr = data_cstr
+        .as_ref()
+        .map(|c| c.as_ptr() as *const libc::c_void)
+        .unwrap_or(core::ptr::null());
+
+    // SAFETY: mount() syscall with valid pointers
+    let ret = unsafe {
+        libc::mount(
+            source_cstr.as_ptr(),
+            target_cstr.as_ptr(),
+            fstype_cstr.as_ptr(),
+            flags,
+            data_ptr,
+        )
+    };
+
+    if ret < 0 {
+        let errno = unsafe { *libc::__errno_location() };
+        return Err(anyhow!("mount {} on {}: errno {}", source, target, errno));
+    }
+    Ok(())
 }
 
 /// Remount a filesystem as read-only.
 /// Security hardening: prevents writes to the root filesystem after init,
 /// reducing attack surface in the confidential VM.
 pub fn readonly(target: &str) -> Result<()> {
-    let flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_RDONLY | MsFlags::MS_REMOUNT;
-    nix::mount::mount(None::<&str>, target, None::<&str>, flags, None::<&str>)
-        .with_context(|| format!("remount {target} readonly"))
+    let flags = flags::MS_NOSUID | flags::MS_NODEV | flags::MS_RDONLY | flags::MS_REMOUNT;
+
+    let target_cstr = CString::new(target).unwrap();
+
+    // SAFETY: mount() with MS_REMOUNT doesn't need source/fstype
+    let ret = unsafe {
+        libc::mount(
+            core::ptr::null(),
+            target_cstr.as_ptr(),
+            core::ptr::null(),
+            flags,
+            core::ptr::null(),
+        )
+    };
+
+    if ret < 0 {
+        let errno = unsafe { *libc::__errno_location() };
+        return Err(anyhow!("remount {} readonly: errno {}", target, errno));
+    }
+    Ok(())
 }
 
 /// Check if a filesystem type is available in the kernel.
@@ -40,7 +96,7 @@ fn mount_optional(
     source: &str,
     target: &str,
     fstype: &str,
-    flags: MsFlags,
+    flags: libc::c_ulong,
 ) -> Result<()> {
     if fs_available(filesystems, fstype) && fs::exists(target) {
         mount(source, target, fstype, flags, None)?;
@@ -92,11 +148,11 @@ pub fn setup() -> Result<()> {
 
 /// Internal: setup with configurable root path (for testing with temp directories).
 fn setup_at(root: &str) -> Result<()> {
-    let common = MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_NODEV | MsFlags::MS_RELATIME;
+    let common = flags::MS_NOSUID | flags::MS_NOEXEC | flags::MS_NODEV | flags::MS_RELATIME;
 
     mount("proc", &format!("{root}/proc"), "proc", common, None)?;
 
-    let dev_flags = MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_RELATIME;
+    let dev_flags = flags::MS_NOSUID | flags::MS_NOEXEC | flags::MS_RELATIME;
     mount(
         "dev",
         &format!("{root}/dev"),
@@ -114,7 +170,7 @@ fn setup_at(root: &str) -> Result<()> {
         Some("mode=0755"),
     )?;
 
-    let tmp_flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_RELATIME;
+    let tmp_flags = flags::MS_NOSUID | flags::MS_NODEV | flags::MS_RELATIME;
     mount("tmpfs", &format!("{root}/tmp"), "tmpfs", tmp_flags, None)?;
 
     // Read once for all optional mounts
@@ -171,13 +227,7 @@ mod tests {
     fn test_mount_optional_target_not_exists() {
         // When target path doesn't exist, should be no-op
         let filesystems = "nodev tmpfs\n";
-        let result = mount_optional(
-            filesystems,
-            "tmpfs",
-            "/nonexistent/path",
-            "tmpfs",
-            MsFlags::empty(),
-        );
+        let result = mount_optional(filesystems, "tmpfs", "/nonexistent/path", "tmpfs", 0);
         assert!(result.is_ok());
     }
 
@@ -185,14 +235,7 @@ mod tests {
 
     #[test]
     fn test_mount_fails_nonexistent_target() {
-        let err = mount(
-            "tmpfs",
-            "/nonexistent/mount/point",
-            "tmpfs",
-            MsFlags::empty(),
-            None,
-        )
-        .unwrap_err();
+        let err = mount("tmpfs", "/nonexistent/mount/point", "tmpfs", 0, None).unwrap_err();
         assert!(
             err.to_string().contains("/nonexistent/mount/point"),
             "error should mention the path: {}",
@@ -217,7 +260,6 @@ mod tests {
     #[test]
     fn test_setup_at_with_temp_root() {
         use crate::test_utils::require_root;
-        use nix::mount::umount;
         use tempfile::TempDir;
 
         require_root();
@@ -244,12 +286,15 @@ mod tests {
                 // Log failures but don't panic - cleanup is best-effort
                 for dir in ["tmp", "run", "sys", "dev", "proc"] {
                     let path = format!("{}/{}", self.root, dir);
-                    if let Err(e) = umount(path.as_str()) {
+                    let path_cstr = std::ffi::CString::new(path.as_str()).unwrap();
+                    // SAFETY: umount with valid path is safe
+                    let ret = unsafe { libc::umount(path_cstr.as_ptr()) };
+                    if ret < 0 {
                         // In tests, unmount failures are expected if mount never succeeded
                         // or if the test itself failed. Only log when debugging is enabled.
                         // Set MOUNT_TEST_DEBUG=1 to see cleanup warnings during test runs.
                         if std::env::var("MOUNT_TEST_DEBUG").is_ok() {
-                            eprintln!("Warning: Failed to unmount {}: {:?}", path, e);
+                            eprintln!("Warning: Failed to unmount {}", path);
                         }
                     }
                 }

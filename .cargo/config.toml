@@ -1,5 +1,8 @@
+# build-std is specified per-target below for musl targets only.
+# Tests run on host target without build-std to avoid core conflicts.
 
 [target.aarch64-unknown-linux-musl]
+build-std = ["core", "alloc"]
 rustflags = [
     "-C", "linker=musl-gcc",
     "-C", "target-feature=+crt-static", # Use static crt
@@ -11,6 +14,7 @@ rustflags = [
 
 
 [target.x86_64-unknown-linux-musl]
+build-std = ["core", "alloc"]
 rustflags = [
     "-C", "linker=musl-gcc",
     "-C", "target-feature=+crt-static", # Use static crt
