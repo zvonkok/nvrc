@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) NVIDIA CORPORATION
 
-use anyhow::{anyhow, Result};
+use anyhow::{Context, Result};
 use hardened_std::fs;
 
 use crate::execute::background;
@@ -49,7 +49,7 @@ impl NVRC {
     }
 
     fn spawn_persistenced(&mut self, run_dir: &str, bin: &'static str) -> Result<()> {
-        fs::create_dir_all(run_dir).map_err(|e| anyhow!("create_dir_all {}: {}", run_dir, e))?;
+        fs::create_dir_all(run_dir).context("create_dir_all for persistenced")?;
         let uvm_enabled = self.uvm_persistence_mode.unwrap_or(true);
         let args = persistenced_args(uvm_enabled);
         let child = background(bin, &args)?;

@@ -14,18 +14,13 @@ pub fn foreground(command: &'static str, args: &[&str]) -> Result<()> {
 
     let kmsg_file = kmsg().context("Failed to open kmsg device")?;
     let mut cmd = Command::new(command);
-    cmd.args(args)
-        .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
+    cmd.args(args).context("Invalid arguments")?;
     cmd.stdout(Stdio::from(
-        kmsg_file
-            .try_clone()
-            .map_err(|e| anyhow!("Failed to clone kmsg file: {}", e))?,
+        kmsg_file.try_clone().context("Failed to clone kmsg file")?,
     ));
     cmd.stderr(Stdio::from(kmsg_file));
 
-    let status = cmd
-        .status()
-        .map_err(|e| anyhow!("Binary not allowed or failed to execute {}: {}", command, e))?;
+    let status = cmd.status().context("Failed to execute command")?;
 
     if !status.success() {
         return Err(anyhow!("{} failed ({})", command, status));
@@ -40,17 +35,13 @@ pub fn background(command: &'static str, args: &[&str]) -> Result<Child> {
     debug!("{} {}", command, args.join(" "));
     let kmsg_file = kmsg().context("Failed to open kmsg device")?;
     let mut cmd = Command::new(command);
-    cmd.args(args)
-        .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
+    cmd.args(args).context("Invalid arguments")?;
     cmd.stdout(Stdio::from(
-        kmsg_file
-            .try_clone()
-            .map_err(|e| anyhow!("Failed to clone kmsg file: {}", e))?,
+        kmsg_file.try_clone().context("Failed to clone kmsg file")?,
     ));
     cmd.stderr(Stdio::from(kmsg_file));
 
-    cmd.spawn()
-        .map_err(|e| anyhow!("Binary not allowed or failed to start {}: {}", command, e))
+    cmd.spawn().context("Failed to spawn command")
 }
 
 #[cfg(test)]
@@ -79,8 +70,13 @@ mod tests {
         // Command not in whitelist
         let result = foreground("/nonexistent/command", &[]);
         assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("not allowed"));
+        // Error chain: context("Failed to execute command") wraps "Binary not in allowed list"
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(
+            err.contains("not in allowed list"),
+            "error should contain 'not in allowed list': {}",
+            err
+        );
     }
 
     #[test]
@@ -108,10 +104,11 @@ mod tests {
         // Command not in whitelist
         let result = background("/nonexistent/command", &[]);
         assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
+        // Error chain: context("Failed to spawn command") wraps "Binary not in allowed list"
+        let err = format!("{:#}", result.unwrap_err());
         assert!(
-            err.contains("not allowed"),
-            "error should mention not allowed: {}",
+            err.contains("not in allowed list"),
+            "error should mention 'not in allowed list': {}",
             err
         );
     }

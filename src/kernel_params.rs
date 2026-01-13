@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use hardened_std::fs;
 use log::{debug, warn};
 
@@ -24,8 +24,7 @@ impl NVRC {
     pub fn process_kernel_params(&mut self, cmdline: Option<&str>) -> Result<()> {
         let content = match cmdline {
             Some(c) => c.to_owned(),
-            None => fs::read_to_string("/proc/cmdline")
-                .map_err(|e| anyhow!("read /proc/cmdline: {}", e))?,
+            None => fs::read_to_string("/proc/cmdline").context("read /proc/cmdline")?,
         };
 
         for (k, v) in content.split_whitespace().filter_map(|p| p.split_once('=')) {
@@ -87,8 +86,7 @@ fn nvrc_log(value: &str, _ctx: &mut NVRC) -> Result<()> {
 
     log::set_max_level(lvl);
     debug!("nvrc.log: {}", log::max_level());
-    fs::write("/proc/sys/kernel/printk_devkmsg", b"on\n")
-        .map_err(|e| anyhow!("printk_devkmsg: {}", e))?;
+    fs::write("/proc/sys/kernel/printk_devkmsg", b"on\n").context("printk_devkmsg")?;
 
     Ok(())
 }

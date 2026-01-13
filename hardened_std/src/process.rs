@@ -17,7 +17,7 @@
 //! - /bin/nv-hostengine - DCGM host engine
 //! - /bin/dcgm-exporter - DCGM metrics exporter
 //! - /bin/nv-fabricmanager - NVLink fabric manager
-//! - /bin/kata-agent - Kata runtime agent
+//! - /usr/bin/kata-agent - Kata runtime agent
 //!
 //! **Test binaries (debug builds only):**
 //! - /bin/true, /bin/false, /bin/sleep, /bin/sh - For unit tests
@@ -45,7 +45,7 @@ fn is_binary_allowed(path: &str) -> bool {
             | "/bin/nv-hostengine"
             | "/bin/dcgm-exporter"
             | "/bin/nv-fabricmanager"
-            | "/bin/kata-agent"
+            | "/usr/bin/kata-agent"
     );
 
     if production_allowed {
@@ -370,7 +370,7 @@ mod tests {
         assert!(is_binary_allowed("/bin/nv-hostengine"));
         assert!(is_binary_allowed("/bin/dcgm-exporter"));
         assert!(is_binary_allowed("/bin/nv-fabricmanager"));
-        assert!(is_binary_allowed("/bin/kata-agent"));
+        assert!(is_binary_allowed("/usr/bin/kata-agent"));
     }
 
     #[test]

@@ -3,11 +3,10 @@
 
 use anyhow::{anyhow, Context, Result};
 use hardened_std::fs;
+use hardened_std::process::Command;
 use log::{debug, error};
 use nix::unistd::{fork, ForkResult};
 use rlimit::{setrlimit, Resource};
-use std::os::unix::process::CommandExt;
-use std::process::Command;
 
 const KATA_AGENT_PATH: &str = "/usr/bin/kata-agent";
 
@@ -27,7 +26,7 @@ fn agent_setup() -> Result<()> {
     let nofile = 1024 * 1024;
     setrlimit(Resource::NOFILE, nofile, nofile).context("setrlimit RLIMIT_NOFILE")?;
     fs::write("/proc/self/oom_score_adj", OOM_SCORE_ADJ.as_bytes())
-        .map_err(|e| anyhow!("write /proc/self/oom_score_adj: {}", e))?;
+        .context("write /proc/self/oom_score_adj")?;
     let lim = rlimit::getrlimit(Resource::NOFILE)?;
     debug!("kata-agent RLIMIT_NOFILE: {:?}", lim);
     Ok(())
@@ -35,13 +34,13 @@ fn agent_setup() -> Result<()> {
 
 /// exec() replaces this process with kata-agent, so it only returns on failure.
 /// We want kata-agent to become PID 1's child for proper process hierarchy.
-fn exec_agent(cmd: &str) -> Result<()> {
+fn exec_agent(cmd: &'static str) -> Result<()> {
     let err = Command::new(cmd).exec();
     Err(anyhow!("exec {} failed: {err}", cmd))
 }
 
 /// Path parameter enables testing with /bin/true instead of real kata-agent
-fn kata_agent(path: &str) -> Result<()> {
+fn kata_agent(path: &'static str) -> Result<()> {
     agent_setup()?;
     exec_agent(path)
 }

@@ -242,6 +242,66 @@ pub fn write(path: &str, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Allowed paths for existence checks (mount.rs optional mounts)
+const ALLOWED_EXISTS_PREFIXES: &[&str] = &[
+    "/sys/kernel/security",      // securityfs mount point
+    "/sys/firmware/efi/efivars", // efivarfs mount point
+];
+
+/// Check if a path exists
+///
+/// # Security Constraints
+/// - Only paths under allowed prefixes can be checked
+/// - Used for mount.rs optional filesystem mounts
+///
+/// # Returns
+/// - `true` if path exists (file, directory, symlink, etc.)
+/// - `false` if path doesn't exist or is not in whitelist
+pub fn exists(path: &str) -> bool {
+    // Path safety check
+    if !is_safe_path(path) {
+        return false;
+    }
+
+    // Path whitelist - only allow specific prefixes
+    let allowed = ALLOWED_EXISTS_PREFIXES
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+        || {
+            #[cfg(test)]
+            {
+                ALLOWED_TEST_PREFIXES
+                    .iter()
+                    .any(|prefix| path.starts_with(prefix))
+                    || ALLOWED_TEMPDIR_PREFIXES
+                        .iter()
+                        .any(|prefix| path.starts_with(prefix))
+            }
+            #[cfg(not(test))]
+            {
+                false
+            }
+        };
+
+    if !allowed {
+        return false;
+    }
+
+    // Path length check
+    if path.len() > MAX_PATH_LEN {
+        return false;
+    }
+
+    // Convert to C string
+    let mut path_buf = [0u8; PATH_BUF_SIZE];
+    path_buf[..path.len()].copy_from_slice(path.as_bytes());
+
+    // SAFETY: access() with F_OK checks if path exists
+    let result = unsafe { libc::access(path_buf.as_ptr() as *const libc::c_char, libc::F_OK) };
+
+    result == 0
+}
+
 /// Read entire file to string with path whitelist
 ///
 /// # Security Constraints
@@ -808,6 +868,29 @@ mod tests {
         // Opening without write mode should fail
         let result = OpenOptions::new().open("/dev/null");
         assert!(matches!(result, Err(Error::InvalidInput(_))));
+    }
+
+    #[test]
+    fn test_exists() {
+        let path = test_path("exists_test");
+
+        // Non-existent file returns false
+        assert!(!exists(&path));
+
+        // Create file, now exists
+        std::fs::write(&path, b"test").unwrap();
+        assert!(exists(&path));
+
+        // Cleanup
+        let _ = std::fs::remove_file(&path);
+        assert!(!exists(&path));
+    }
+
+    #[test]
+    fn test_exists_whitelist() {
+        // Paths not in whitelist return false (not error)
+        assert!(!exists("/etc/passwd"));
+        assert!(!exists("/var/log/syslog"));
     }
 }
 

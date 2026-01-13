@@ -3,10 +3,9 @@
 
 //! Filesystem setup for the minimal init environment.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use hardened_std::fs;
 use nix::mount::MsFlags;
-use std::path::Path;
 
 /// Mount a filesystem. Errors if mount fails.
 fn mount(
@@ -43,7 +42,7 @@ fn mount_optional(
     fstype: &str,
     flags: MsFlags,
 ) -> Result<()> {
-    if fs_available(filesystems, fstype) && Path::new(target).exists() {
+    if fs_available(filesystems, fstype) && fs::exists(target) {
         mount(source, target, fstype, flags, None)?;
     }
     Ok(())
@@ -119,8 +118,7 @@ fn setup_at(root: &str) -> Result<()> {
     mount("tmpfs", &format!("{root}/tmp"), "tmpfs", tmp_flags, None)?;
 
     // Read once for all optional mounts
-    let filesystems = fs::read_to_string("/proc/filesystems")
-        .map_err(|e| anyhow!("read /proc/filesystems: {}", e))?;
+    let filesystems = fs::read_to_string("/proc/filesystems").context("read /proc/filesystems")?;
 
     mount_optional(
         &filesystems,
@@ -148,6 +146,7 @@ fn setup_at(root: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     // === fs_available tests ===
 

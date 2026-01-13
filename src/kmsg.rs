@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) NVIDIA CORPORATION
 
-use anyhow::{anyhow, Result};
+use anyhow::{Context, Result};
 use hardened_std::fs::{self, File, OpenOptions};
-use std::sync::Once;
+use once_cell::sync::OnceCell;
 
-static KERNLOG_INIT: Once = Once::new();
+static KERNLOG_INIT: OnceCell<()> = OnceCell::new();
 
 /// Socket buffer size (16MB = 16 * 1024 * 1024 = 16777216 bytes).
 /// Large buffers prevent message loss during high-throughput GPU operations
@@ -16,7 +16,7 @@ const SOCKET_BUFFER_SIZE: &str = "16777216";
 /// Large buffers (16MB) prevent message loss during high-throughput GPU operations
 /// where drivers may emit bursts of diagnostic data.
 pub fn kernlog_setup() -> Result<()> {
-    KERNLOG_INIT.call_once(|| {
+    KERNLOG_INIT.get_or_init(|| {
         let _ = kernlog::init();
     });
     log::set_max_level(log::LevelFilter::Off);
@@ -27,7 +27,7 @@ pub fn kernlog_setup() -> Result<()> {
         "/proc/sys/net/core/wmem_max",
     ] {
         fs::write(path, SOCKET_BUFFER_SIZE.as_bytes())
-            .map_err(|e| anyhow!("write {}: {}", path, e))?;
+            .with_context(|| format!("write {}", path))?;
     }
     Ok(())
 }
@@ -48,7 +48,7 @@ fn kmsg_at(path: &str) -> Result<File> {
     OpenOptions::new()
         .write(true)
         .open(path)
-        .map_err(|e| anyhow!("open {}: {}", path, e))
+        .with_context(|| format!("open {}", path))
 }
 
 #[cfg(test)]
