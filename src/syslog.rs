@@ -8,9 +8,11 @@
 //! levels are stripped since all messages go to the same destination anyway.
 
 use log::trace;
-use nix::poll::{PollFd, PollFlags, PollTimeout};
 use once_cell::sync::OnceCell;
-use std::os::fd::AsFd;
+use rustix::event::{poll as rustix_poll, PollFd, PollFlags};
+use rustix::fd::BorrowedFd;
+use rustix::time::Timespec;
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixDatagram;
 use std::path::Path;
 
@@ -29,20 +31,28 @@ fn bind(path: &Path) -> std::io::Result<UnixDatagram> {
 /// Check socket for pending messages (non-blocking).
 /// Returns None if no data available, Some(msg) if a message was read.
 fn poll_socket(sock: &UnixDatagram) -> std::io::Result<Option<String>> {
-    let mut fds = [PollFd::new(sock.as_fd(), PollFlags::POLLIN)];
-    // Non-blocking poll—init loop calls this frequently, can't afford to block
-    let count = nix::poll::poll(&mut fds, PollTimeout::ZERO)
+    const ZERO_TIMEOUT: Timespec = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: The socket is valid for the lifetime of this function call,
+    // and we don't close or transfer ownership of the fd.
+    let fd = unsafe { BorrowedFd::borrow_raw(sock.as_raw_fd()) };
+    let mut fds = [PollFd::new(&fd, PollFlags::IN)];
+    // Non-blocking poll with zero timeout—init loop calls this frequently, can't afford to block
+    let count = rustix_poll(&mut fds, Some(&ZERO_TIMEOUT))
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
     if count == 0 {
         return Ok(None); // No events, no data waiting
     }
 
-    let Some(revents) = fds[0].revents() else {
+    let revents = fds[0].revents();
+    if revents.is_empty() {
         return Ok(None); // Shouldn't happen, but handle gracefully
-    };
+    }
 
-    if !revents.contains(PollFlags::POLLIN) {
+    if !revents.contains(PollFlags::IN) {
         return Ok(None); // Event wasn't POLLIN (e.g., error flag)
     }
 

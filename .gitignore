@@ -1,6 +1,7 @@
 # Rust build artifacts
 /target/
 Cargo.lock
+CLAUDE.md
 
 # Development artifacts
 *.swp

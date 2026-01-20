@@ -7,14 +7,14 @@
 //! action is configurable via `set_panic_hook_with()`.
 
 use crate::macros::ResultExt;
-use nix::sys::reboot::{reboot, RebootMode};
-use nix::unistd::sync;
+use rustix::fs::sync;
+use rustix::system::{reboot, RebootCommand};
 use std::fs;
 use std::panic;
 
 /// Default shutdown action: power off the VM.
 fn power_off() {
-    let _ = reboot(RebootMode::RB_POWER_OFF);
+    let _ = reboot(RebootCommand::PowerOff);
 }
 
 /// Install a panic handler that powers off the VM instead of unwinding.

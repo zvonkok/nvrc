@@ -4,13 +4,14 @@
 //! Filesystem setup for the minimal init environment.
 
 use crate::macros::ResultExt;
-use nix::mount::MsFlags;
+use rustix::mount::MountFlags;
+use std::ffi::CStr;
 use std::fs;
 use std::path::Path;
 
 /// Mount a filesystem. Errors if mount fails.
-fn mount(source: &str, target: &str, fstype: &str, flags: MsFlags, data: Option<&str>) {
-    nix::mount::mount(Some(source), target, Some(fstype), flags, data)
+fn mount(source: &str, target: &str, fstype: &str, flags: MountFlags, data: Option<&CStr>) {
+    rustix::mount::mount(source, target, fstype, flags, data)
         .or_panic(format_args!("mount {source} on {target}"));
 }
 
@@ -18,8 +19,9 @@ fn mount(source: &str, target: &str, fstype: &str, flags: MsFlags, data: Option<
 /// Security hardening: prevents writes to the root filesystem after init,
 /// reducing attack surface in the confidential VM.
 pub fn readonly(target: &str) {
-    let flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_RDONLY | MsFlags::MS_REMOUNT;
-    nix::mount::mount(None::<&str>, target, None::<&str>, flags, None::<&str>)
+    // mount_remount automatically adds MS_REMOUNT
+    let flags = MountFlags::NOSUID | MountFlags::NODEV | MountFlags::RDONLY;
+    rustix::mount::mount_remount(target, flags, "")
         .or_panic(format_args!("remount {target} readonly"));
 }
 
@@ -30,7 +32,7 @@ fn fs_available(filesystems: &str, fstype: &str) -> bool {
 
 /// Mount optional filesystem if the fstype is available AND the target exists.
 /// Used for securityfs and efivarfs that may not be present on all kernels.
-fn mount_optional(filesystems: &str, source: &str, target: &str, fstype: &str, flags: MsFlags) {
+fn mount_optional(filesystems: &str, source: &str, target: &str, fstype: &str, flags: MountFlags) {
     if fs_available(filesystems, fstype) && Path::new(target).exists() {
         mount(source, target, fstype, flags, None);
     }
@@ -47,19 +49,21 @@ pub fn setup() {
 
 /// Internal: setup with configurable root path (for testing with temp directories).
 fn setup_at(root: &str) {
-    let common = MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_NODEV | MsFlags::MS_RELATIME;
+    const MODE_0755: &CStr = c"mode=0755";
+
+    let common = MountFlags::NOSUID | MountFlags::NOEXEC | MountFlags::NODEV | MountFlags::RELATIME;
 
     mount("proc", &format!("{root}/proc"), "proc", common, None);
 
     // devtmpfs automatically creates /dev/null, /dev/zero, /dev/random, /dev/urandom
     // Symlinks (/dev/stdin, /dev/stdout, /dev/stderr, /dev/fd, /dev/core) are created by kata-agent
-    let dev_flags = MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_RELATIME;
+    let dev_flags = MountFlags::NOSUID | MountFlags::NOEXEC | MountFlags::RELATIME;
     mount(
         "dev",
         &format!("{root}/dev"),
         "devtmpfs",
         dev_flags,
-        Some("mode=0755"),
+        Some(MODE_0755),
     );
 
     mount("sysfs", &format!("{root}/sys"), "sysfs", common, None);
@@ -68,10 +72,10 @@ fn setup_at(root: &str) {
         &format!("{root}/run"),
         "tmpfs",
         common,
-        Some("mode=0755"),
+        Some(MODE_0755),
     );
 
-    let tmp_flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_RELATIME;
+    let tmp_flags = MountFlags::NOSUID | MountFlags::NODEV | MountFlags::RELATIME;
     mount("tmpfs", &format!("{root}/tmp"), "tmpfs", tmp_flags, None);
 
     // Read once for all optional mounts
@@ -126,7 +130,7 @@ mod tests {
             "tmpfs",
             "/nonexistent/path",
             "tmpfs",
-            MsFlags::empty(),
+            MountFlags::empty(),
         );
     }
 
@@ -141,7 +145,7 @@ mod tests {
                 "tmpfs",
                 "/nonexistent/mount/point",
                 "tmpfs",
-                MsFlags::empty(),
+                MountFlags::empty(),
                 None,
             );
         });
@@ -162,7 +166,7 @@ mod tests {
 
     #[test]
     fn test_setup_at_with_temp_root() {
-        use nix::mount::umount;
+        use rustix::mount::{unmount, UnmountFlags};
         use tempfile::TempDir;
 
         require_root();
@@ -186,7 +190,7 @@ mod tests {
 
         // Cleanup: unmount in reverse order
         for dir in ["tmp", "run", "sys", "dev", "proc"] {
-            let _ = umount(format!("{root}/{dir}").as_str());
+            let _ = unmount(format!("{root}/{dir}").as_str(), UnmountFlags::empty());
         }
     }
 }
