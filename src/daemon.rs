@@ -98,7 +98,7 @@ impl NVRC {
             .or_panic(format_args!("set permissions {FM_RUNTIME_CONFIG}"));
         let mut reader = kmsg::open_kmsg("/dev/kmsg");
         self.spawn_fabricmanager("/bin/nv-fabricmanager");
-        kmsg::wait_for_marker(&mut reader, "FM starting NvLink Inband", 120);
+        kmsg::wait_for_marker(&mut reader, "Completed processing topology events", 120);
     }
 
     fn spawn_fabricmanager(&mut self, bin: &str) {
@@ -124,8 +124,10 @@ impl NVRC {
         };
         let guid_owned = guid.clone();
         let args = vec!["-F", NVLSM_CONFIG, "-g", &guid_owned, "-f", "stdout"];
+        let mut reader = kmsg::open_kmsg("/dev/kmsg");
         let child = background(bin, &args);
         self.track_daemon("nvlsm", child);
+        kmsg::wait_for_marker(&mut reader, "Setting IS_SM bit in capability mask", 60);
     }
 
     /// Write FABRIC_MODE and PARTITION_RAIL_POLICY to fabricmanager.cfg.
