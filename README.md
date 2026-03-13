@@ -72,6 +72,7 @@ configuration doesn't exist yet.
 | -------------- | ---------------------- | ------- | -------------------------------------------------------------------------------------------------- |
 | `nvrc.smi.lgc` | `<MHz>`                | -       | Lock GPU core clocks to fixed frequency. Eliminates thermal throttling for consistent performance. |
 | `nvrc.smi.lmc` | `<MHz>`                | -       | Lock memory clocks to fixed frequency. Used alongside lgc for fully deterministic GPU behavior.    |
+| `nvrc.smi.lmcd`| `<MHz>`                | -       | Lock memory clocks (deferred) to fixed frequency. Uses `--lock-memory-clocks-deferred`.            |
 | `nvrc.smi.pl`  | `<Watts>`              | -       | Set GPU power limit. Lower values reduce heat/power; higher allows peak performance.               |
 | `nvrc.smi.srs` | `enabled`, `disabled`  | -       | Secure Randomization Seed for GPU memory (passed to nvidia-smi).                                   |
 

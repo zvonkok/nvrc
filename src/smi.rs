@@ -18,6 +18,19 @@ impl NVRC {
         foreground(NVIDIA_SMI, &["-lmc", &mhz.to_string()]);
     }
 
+    /// Lock memory clocks (deferred) to a specific frequency (MHz).
+    /// Reduces memory clock jitter for latency-sensitive workloads.
+    /// Uses --lock-memory-clocks-deferred because -lmc is not yet supported.
+    pub fn nvidia_smi_lmcd(&self) {
+        let Some(mhz) = self.nvidia_smi_lmcd else {
+            return;
+        };
+        foreground(
+            NVIDIA_SMI,
+            &["--lock-memory-clocks-deferred", &mhz.to_string()],
+        );
+    }
+
     /// Lock GPU core clocks to a specific frequency (MHz).
     /// Provides consistent performance by preventing dynamic frequency scaling.
     pub fn nvidia_smi_lgc(&self) {
@@ -80,6 +93,22 @@ mod tests {
     }
 
     // When fields are Some, nvidia-smi is called (panics without NVIDIA hardware)
+
+    #[test]
+    fn test_lmcd_none() {
+        let nvrc = NVRC::default();
+        nvrc.nvidia_smi_lmcd();
+    }
+
+    #[test]
+    fn test_lmcd_some_fails_without_nvidia_smi() {
+        let mut nvrc = NVRC::default();
+        nvrc.nvidia_smi_lmcd = Some(1000);
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            nvrc.nvidia_smi_lmcd();
+        }));
+        assert!(result.is_err());
+    }
 
     #[test]
     fn test_lmc_some_fails_without_nvidia_smi() {
