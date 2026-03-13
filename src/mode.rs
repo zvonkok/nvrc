@@ -12,8 +12,26 @@
 
 use log::debug;
 use std::fs;
+use std::path::PathBuf;
 
 const PCI_DEVICES: &str = "/sys/bus/pci/devices";
+
+/// Return sysfs paths for all GPU PCI devices.
+/// Matches vendor 0x10de with display class 0x03xx.
+pub fn gpu_paths_from(pci_path: &str) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(pci_path) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| {
+            let vendor = fs::read_to_string(e.path().join("vendor")).unwrap_or_default();
+            let class = fs::read_to_string(e.path().join("class")).unwrap_or_default();
+            vendor.trim() == "0x10de" && class.trim().starts_with("0x03")
+        })
+        .map(|e| e.path())
+        .collect()
+}
 
 /// Result of hardware topology detection.
 pub struct Detection {
@@ -111,17 +129,7 @@ fn count_nvswitches_from(pci_path: &str) -> usize {
 }
 
 fn count_gpus_from(pci_path: &str) -> usize {
-    let Ok(entries) = fs::read_dir(pci_path) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .filter(|e| {
-            let vendor = fs::read_to_string(e.path().join("vendor")).unwrap_or_default();
-            let class = fs::read_to_string(e.path().join("class")).unwrap_or_default();
-            vendor.trim() == "0x10de" && class.trim().starts_with("0x03")
-        })
-        .count()
+    gpu_paths_from(pci_path).len()
 }
 
 /// Count NVLink management NICs (SW_MNG marker in PCI VPD).
@@ -214,6 +222,40 @@ mod tests {
     #[test]
     fn test_count_nvswitches_nonexistent() {
         assert_eq!(count_nvswitches_from("/nonexistent/path"), 0);
+    }
+
+    // --- GPU path enumeration ---
+
+    #[test]
+    fn test_gpu_paths_single() {
+        let tmpdir = TempDir::new().unwrap();
+        create_pci_device(&tmpdir, "0000:41:00.0", "0x10de\n", "0x030200\n");
+        let paths = gpu_paths_from(tmpdir.path().to_str().unwrap());
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("0000:41:00.0"));
+    }
+
+    #[test]
+    fn test_gpu_paths_skips_non_gpu() {
+        let tmpdir = TempDir::new().unwrap();
+        create_pci_device(&tmpdir, "0000:41:00.0", "0x10de\n", "0x030200\n");
+        // NVIDIA audio device (class 0x0403)
+        create_pci_device(&tmpdir, "0000:41:00.1", "0x10de\n", "0x040300\n");
+        // Non-NVIDIA device
+        create_pci_device(&tmpdir, "0000:00:02.0", "0x8086\n", "0x030000\n");
+        let paths = gpu_paths_from(tmpdir.path().to_str().unwrap());
+        assert_eq!(paths.len(), 1);
+    }
+
+    #[test]
+    fn test_gpu_paths_empty() {
+        let tmpdir = TempDir::new().unwrap();
+        assert!(gpu_paths_from(tmpdir.path().to_str().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn test_gpu_paths_nonexistent() {
+        assert!(gpu_paths_from("/nonexistent/path").is_empty());
     }
 
     // --- GPU counting ---

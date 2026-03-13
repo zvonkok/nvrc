@@ -6,8 +6,11 @@ use crate::execute::background;
 use crate::kmsg;
 use crate::macros::ResultExt;
 use crate::nvrc::NVRC;
+use nix::sys::signal::{self, Signal};
+use nix::unistd::Pid;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::time::{Duration, Instant};
 
 /// UVM persistence mode keeps unified memory mappings alive between kernel launches,
 /// avoiding expensive page migrations. Enabled by default for ML workloads.
@@ -29,6 +32,42 @@ fn hostengine_args() -> &'static [&'static str] {
 /// and we use the standard counters config shipped with the container image.
 fn dcgm_exporter_args() -> &'static [&'static str] {
     &["-k", "-f", "/etc/dcgm-exporter/default-counters.csv"]
+}
+
+const PERSISTENCED_PID_FILE: &str = "/var/run/nvidia-persistenced/nvidia-persistenced.pid";
+const FM_PID_FILE: &str = "/var/run/nvidia-fabricmanager/nv-fabricmanager.pid";
+
+/// Read a daemon PID from its pidfile, send SIGTERM, and wait for exit.
+/// Used instead of Child::kill() because double-forking daemons (e.g.
+/// nvidia-persistenced) make the original Child handle point to the
+/// already-exited parent process, not the real daemon.
+fn stop_daemon_from_pidfile(pidfile: &str) {
+    let content =
+        fs::read_to_string(pidfile).unwrap_or_else(|e| panic!("read pidfile {pidfile}: {e}"));
+    let pid: i32 = content
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("parse pid from {pidfile}: {e}"));
+    let pid = Pid::from_raw(pid);
+    debug!("SIGTERM {} {}", pidfile, pid);
+    signal::kill(pid, Signal::SIGTERM).unwrap_or_else(|e| panic!("SIGTERM pid {pid}: {e}"));
+    wait_for_exit(pid, STOP_TIMEOUT);
+}
+
+const STOP_TIMEOUT: Duration = Duration::from_secs(30);
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Poll until process is gone. Signal 0 checks existence without sending
+/// anything — ESRCH means the process no longer exists.
+fn wait_for_exit(pid: Pid, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if signal::kill(pid, None).is_err() {
+            return;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    panic!("pid {pid} did not exit within {}s", timeout.as_secs());
 }
 
 const FM_CONFIG: &str = "/usr/share/nvidia/nvswitch/fabricmanager.cfg";
@@ -58,6 +97,23 @@ impl NVRC {
         let args = persistenced_args(uvm_enabled);
         let child = background(bin, &args);
         self.track_daemon("nvidia-persistenced", child);
+    }
+
+    /// Stop nvidia-persistenced by reading its PID from the pidfile,
+    /// sending SIGTERM for graceful shutdown, and waiting for exit.
+    /// nvidia-persistenced double-forks so the Child handle is unreliable.
+    pub fn stop_persistenced(&mut self) {
+        debug!("Stopping nvidia-persistenced via {}", PERSISTENCED_PID_FILE);
+        stop_daemon_from_pidfile(PERSISTENCED_PID_FILE);
+        self.children.retain(|(n, _)| n != "nvidia-persistenced");
+    }
+
+    /// Stop nv-fabricmanager by reading its PID from the pidfile,
+    /// sending SIGTERM for graceful shutdown, and waiting for exit.
+    pub fn stop_fabricmanager(&mut self) {
+        debug!("Stopping nv-fabricmanager via {}", FM_PID_FILE);
+        stop_daemon_from_pidfile(FM_PID_FILE);
+        self.children.retain(|(n, _)| n != "nv-fabricmanager");
     }
 
     /// nv-hostengine is the DCGM backend daemon. Only started when DCGM monitoring
@@ -431,6 +487,84 @@ mod tests {
         let content = fs::read_to_string(path).unwrap();
         assert!(content.contains("FABRIC_MODE=0"));
         assert!(content.contains("PARTITION_RAIL_POLICY=symmetric"));
+    }
+
+    // === stop_daemon_from_pidfile tests ===
+
+    #[test]
+    fn test_stop_daemon_from_pidfile() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+
+        let mut pidfile = NamedTempFile::new().unwrap();
+        write!(pidfile, "{pid}").unwrap();
+
+        stop_daemon_from_pidfile(pidfile.path().to_str().unwrap());
+
+        // Process should be gone after SIGTERM + waitpid
+        let result = signal::kill(Pid::from_raw(pid as i32), None);
+        assert!(result.is_err()); // ESRCH: no such process
+    }
+
+    #[test]
+    fn test_stop_daemon_from_pidfile_missing() {
+        use std::panic;
+        let result = panic::catch_unwind(|| {
+            stop_daemon_from_pidfile("/nonexistent/pidfile");
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_stop_daemon_from_pidfile_invalid_pid() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut pidfile = NamedTempFile::new().unwrap();
+        write!(pidfile, "not_a_number").unwrap();
+
+        let result = std::panic::catch_unwind(|| {
+            stop_daemon_from_pidfile(pidfile.path().to_str().unwrap());
+        });
+        assert!(result.is_err());
+    }
+
+    // === stop_persistenced / stop_fabricmanager retain tests ===
+
+    #[test]
+    fn test_stop_persistenced_removes_from_children() {
+        let mut nvrc = NVRC::default();
+        let child = std::process::Command::new("/bin/true").spawn().unwrap();
+        nvrc.track_daemon("nvidia-persistenced", child);
+        let child2 = std::process::Command::new("/bin/true").spawn().unwrap();
+        nvrc.track_daemon("other-daemon", child2);
+        assert_eq!(nvrc.children.len(), 2);
+
+        // We can't call stop_persistenced() directly because it reads from
+        // the real pidfile path. Test the retain logic instead.
+        nvrc.children.retain(|(n, _)| n != "nvidia-persistenced");
+        assert_eq!(nvrc.children.len(), 1);
+        assert_eq!(nvrc.children[0].0, "other-daemon");
+    }
+
+    #[test]
+    fn test_stop_fabricmanager_removes_from_children() {
+        let mut nvrc = NVRC::default();
+        let child = std::process::Command::new("/bin/true").spawn().unwrap();
+        nvrc.track_daemon("nv-fabricmanager", child);
+        let child2 = std::process::Command::new("/bin/true").spawn().unwrap();
+        nvrc.track_daemon("other-daemon", child2);
+        assert_eq!(nvrc.children.len(), 2);
+
+        nvrc.children.retain(|(n, _)| n != "nv-fabricmanager");
+        assert_eq!(nvrc.children.len(), 1);
+        assert_eq!(nvrc.children[0].0, "other-daemon");
     }
 
     #[test]

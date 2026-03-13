@@ -3,7 +3,13 @@
 //! These functions apply GPU settings via nvidia-smi before workloads run.
 //! All are optional—if the kernel param isn't set, they return immediately.
 
+use log::debug;
+use std::fs;
+
+use crate::daemon::FABRIC_MODE_FULL;
 use crate::execute::foreground;
+use crate::mode;
+use crate::modprobe;
 use crate::nvrc::NVRC;
 
 const NVIDIA_SMI: &str = "/bin/nvidia-smi";
@@ -21,14 +27,40 @@ impl NVRC {
     /// Lock memory clocks (deferred) to a specific frequency (MHz).
     /// Reduces memory clock jitter for latency-sensitive workloads.
     /// Uses --lock-memory-clocks-deferred because -lmc is not yet supported.
-    pub fn nvidia_smi_lmcd(&self) {
+    /// Performs a full driver reload cycle to activate the deferred setting.
+    pub fn nvidia_smi_lmcd(&mut self) {
         let Some(mhz) = self.nvidia_smi_lmcd else {
             return;
         };
+
+        // Apply the deferred clock setting
         foreground(
             NVIDIA_SMI,
             &["--lock-memory-clocks-deferred", &mhz.to_string()],
         );
+
+        // Stop daemons that hold the driver open
+        self.stop_persistenced();
+        if self.nvswitch == Some("nvl4") {
+            self.stop_fabricmanager();
+        }
+
+        // Unload driver modules (reverse order of load)
+        modprobe::unload("nvidia-uvm");
+        modprobe::unload("nvidia");
+
+        // FLR reset all GPUs via sysfs (driver not needed)
+        gpu_flr_reset_from("/sys/bus/pci/devices");
+
+        // Reload driver modules
+        modprobe::load("nvidia");
+        modprobe::load("nvidia-uvm");
+
+        // Restart daemons (fabric manager before persistenced)
+        if self.nvswitch == Some("nvl4") {
+            self.nv_fabricmanager(FABRIC_MODE_FULL, "greedy");
+        }
+        self.nvidia_persistenced();
     }
 
     /// Lock GPU core clocks to a specific frequency (MHz).
@@ -61,10 +93,25 @@ impl NVRC {
     }
 }
 
+/// Perform PCI Function Level Reset (FLR) on all GPUs.
+/// Writes "1" to /sys/bus/pci/devices/<BDF>/reset for each GPU.
+/// Works without the driver loaded.
+fn gpu_flr_reset_from(pci_path: &str) {
+    for path in mode::gpu_paths_from(pci_path) {
+        let reset_path = path.join("reset");
+        debug!("FLR reset: {}", path.display());
+        fs::write(&reset_path, "1").unwrap_or_else(|e| {
+            panic!("FLR reset {}: {e}", reset_path.display());
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::panic;
+    use tempfile::TempDir;
 
     // When fields are None, functions return immediately (no nvidia-smi call)
 
@@ -92,13 +139,13 @@ mod tests {
         nvrc.nvidia_smi_srs();
     }
 
-    // When fields are Some, nvidia-smi is called (panics without NVIDIA hardware)
-
     #[test]
     fn test_lmcd_none() {
-        let nvrc = NVRC::default();
+        let mut nvrc = NVRC::default();
         nvrc.nvidia_smi_lmcd();
     }
+
+    // When fields are Some, nvidia-smi is called (panics without NVIDIA hardware)
 
     #[test]
     fn test_lmcd_some_fails_without_nvidia_smi() {
@@ -148,5 +195,65 @@ mod tests {
             nvrc.nvidia_smi_srs();
         }));
         assert!(result.is_err());
+    }
+
+    // --- FLR reset tests ---
+
+    fn create_pci_device(tmpdir: &TempDir, name: &str, vendor: &str, class: &str) {
+        let dev = tmpdir.path().join(name);
+        fs::create_dir_all(&dev).unwrap();
+        fs::write(dev.join("vendor"), vendor).unwrap();
+        fs::write(dev.join("class"), class).unwrap();
+        fs::write(dev.join("reset"), "").unwrap();
+    }
+
+    #[test]
+    fn test_gpu_flr_reset_single_gpu() {
+        let tmpdir = TempDir::new().unwrap();
+        create_pci_device(&tmpdir, "0000:41:00.0", "0x10de\n", "0x030200\n");
+        gpu_flr_reset_from(tmpdir.path().to_str().unwrap());
+        let content = fs::read_to_string(tmpdir.path().join("0000:41:00.0/reset")).unwrap();
+        assert_eq!(content, "1");
+    }
+
+    #[test]
+    fn test_gpu_flr_reset_multiple_gpus() {
+        let tmpdir = TempDir::new().unwrap();
+        create_pci_device(&tmpdir, "0000:41:00.0", "0x10de\n", "0x030200\n");
+        create_pci_device(&tmpdir, "0000:42:00.0", "0x10de\n", "0x030000\n");
+        gpu_flr_reset_from(tmpdir.path().to_str().unwrap());
+        for bdf in ["0000:41:00.0", "0000:42:00.0"] {
+            let content = fs::read_to_string(tmpdir.path().join(bdf).join("reset")).unwrap();
+            assert_eq!(content, "1");
+        }
+    }
+
+    #[test]
+    fn test_gpu_flr_reset_skips_non_gpu() {
+        let tmpdir = TempDir::new().unwrap();
+        create_pci_device(&tmpdir, "0000:41:00.0", "0x10de\n", "0x030200\n");
+        // NVIDIA audio device (class 0x0403)
+        create_pci_device(&tmpdir, "0000:41:00.1", "0x10de\n", "0x040300\n");
+        // Non-NVIDIA device
+        create_pci_device(&tmpdir, "0000:00:02.0", "0x8086\n", "0x030000\n");
+        gpu_flr_reset_from(tmpdir.path().to_str().unwrap());
+        // Only the GPU should be reset
+        let gpu = fs::read_to_string(tmpdir.path().join("0000:41:00.0/reset")).unwrap();
+        assert_eq!(gpu, "1");
+        let audio = fs::read_to_string(tmpdir.path().join("0000:41:00.1/reset")).unwrap();
+        assert_eq!(audio, "");
+        let intel = fs::read_to_string(tmpdir.path().join("0000:00:02.0/reset")).unwrap();
+        assert_eq!(intel, "");
+    }
+
+    #[test]
+    fn test_gpu_flr_reset_empty_dir() {
+        let tmpdir = TempDir::new().unwrap();
+        gpu_flr_reset_from(tmpdir.path().to_str().unwrap());
+    }
+
+    #[test]
+    fn test_gpu_flr_reset_nonexistent_dir() {
+        gpu_flr_reset_from("/nonexistent/path");
     }
 }

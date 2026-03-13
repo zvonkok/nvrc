@@ -26,10 +26,12 @@ pub struct NVRC {
     /// Enable DCGM exporter for GPU metrics
     pub dcgm_enabled: Option<bool>,
 
+    /// NVSwitch generation: None, "nvl4", or "nvl5"
+    pub nvswitch: Option<&'static str>,
     /// Port GUID for NVL5+ systems (0x-prefixed hex string)
     pub port_guid: Option<String>,
     /// Tracked background daemons for health monitoring
-    children: Vec<(String, Child)>,
+    pub(crate) children: Vec<(String, Child)>,
 }
 
 impl NVRC {

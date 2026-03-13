@@ -38,7 +38,9 @@ use toolkit::nvidia_ctk_cdi;
 /// and monitoring daemons before workloads can use the GPU.
 /// On bare metal HGX systems (GPUs + NVSwitches), also starts
 /// the fabric manager via the appropriate NVSwitch mode.
-fn mode_gpu(init: &mut NVRC, nvswitch: Option<&str>) {
+fn mode_gpu(init: &mut NVRC, nvswitch: Option<&'static str>) {
+    init.nvswitch = nvswitch;
+
     modprobe::load("nvidia");
     modprobe::load("nvidia-uvm");
 
