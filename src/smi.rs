@@ -8,6 +8,7 @@ use std::fs;
 
 use crate::daemon::FABRIC_MODE_FULL;
 use crate::execute::foreground;
+use crate::kmsg;
 use crate::mode;
 use crate::modprobe;
 use crate::nvrc::NVRC;
@@ -33,27 +34,42 @@ impl NVRC {
             return;
         };
 
-        // Apply the deferred clock setting
+        // --lock-memory-clocks-deferred stores the setting in the
+        // loaded driver and activates it on the *next* driver load.
         foreground(
             NVIDIA_SMI,
             &["--lock-memory-clocks-deferred", &mhz.to_string()],
         );
+        self.driver_reload();
+    }
 
+    /// Full driver reload cycle: stop daemons, unload modules,
+    /// FLR reset GPUs, reload modules, restart daemons.
+    fn driver_reload(&mut self) {
         // Stop daemons that hold the driver open
+        let mut reader = kmsg::open_kmsg("/dev/kmsg");
         self.stop_persistenced();
         if self.nvswitch == Some("nvl4") {
             self.stop_fabricmanager();
         }
+        kmsg::wait_for_marker(&mut reader, "PID file closed", 30);
 
-        // Unload driver modules (reverse order of load)
-        modprobe::unload("nvidia-uvm");
-        modprobe::unload("nvidia");
+        // Unload driver modules (reverse dependency order).
+        // nvidia-uvm and nvidia-modeset both hold refs on nvidia,
+        // so they must be removed first.  Retry because the kernel
+        // may still hold references briefly after persistenced exits
+        // (UVM cleanup, GSP teardown).
+        let interval = std::time::Duration::from_secs(1);
+        modprobe::unload_retry("nvidia-uvm", 10, interval);
+        modprobe::unload_retry("nvidia-modeset", 10, interval);
+        modprobe::unload_retry("nvidia", 10, interval);
 
         // FLR reset all GPUs via sysfs (driver not needed)
         gpu_flr_reset_from("/sys/bus/pci/devices");
 
-        // Reload driver modules
+        // Reload driver modules (forward dependency order)
         modprobe::load("nvidia");
+        modprobe::load("nvidia-modeset");
         modprobe::load("nvidia-uvm");
 
         // Restart daemons (fabric manager before persistenced)

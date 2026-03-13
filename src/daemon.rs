@@ -6,7 +6,9 @@ use crate::execute::background;
 use crate::kmsg;
 use crate::macros::ResultExt;
 use crate::nvrc::NVRC;
+use crate::syslog;
 use nix::sys::signal::{self, Signal};
+use nix::sys::wait::{waitpid, WaitPidFlag};
 use nix::unistd::Pid;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -34,40 +36,81 @@ fn dcgm_exporter_args() -> &'static [&'static str] {
     &["-k", "-f", "/etc/dcgm-exporter/default-counters.csv"]
 }
 
-const PERSISTENCED_PID_FILE: &str = "/var/run/nvidia-persistenced/nvidia-persistenced.pid";
-const FM_PID_FILE: &str = "/var/run/nvidia-fabricmanager/nv-fabricmanager.pid";
-
-/// Read a daemon PID from its pidfile, send SIGTERM, and wait for exit.
-/// Used instead of Child::kill() because double-forking daemons (e.g.
-/// nvidia-persistenced) make the original Child handle point to the
-/// already-exited parent process, not the real daemon.
-fn stop_daemon_from_pidfile(pidfile: &str) {
-    let content =
-        fs::read_to_string(pidfile).unwrap_or_else(|e| panic!("read pidfile {pidfile}: {e}"));
-    let pid: i32 = content
-        .trim()
-        .parse()
-        .unwrap_or_else(|e| panic!("parse pid from {pidfile}: {e}"));
-    let pid = Pid::from_raw(pid);
-    debug!("SIGTERM {} {}", pidfile, pid);
-    signal::kill(pid, Signal::SIGTERM).unwrap_or_else(|e| panic!("SIGTERM pid {pid}: {e}"));
-    wait_for_exit(pid, STOP_TIMEOUT);
-}
+/// Kernel TASK_COMM_LEN is 16 (15 usable chars). These match what
+/// /proc/<PID>/comm reports for each daemon binary.
+const PERSISTENCED_COMM: &str = "nvidia-persiste";
+const FM_COMM: &str = "nv-fabricmanage";
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Poll until process is gone. Signal 0 checks existence without sending
-/// anything — ESRCH means the process no longer exists.
-fn wait_for_exit(pid: Pid, timeout: Duration) {
+/// Find a process by its comm name in /proc, send SIGTERM, and poll until
+/// the process is gone. Uses /proc/<PID>/comm as the kernel's source of
+/// truth — immune to double-fork pidfile issues.
+fn stop_daemon_by_comm(name: &str) {
+    let pids = find_pids_by_comm_from("/proc", name);
+    if pids.is_empty() {
+        panic!("stop_daemon_by_comm: no process found for {name}");
+    }
+    for &pid in &pids {
+        debug!("SIGTERM {name} pid {pid}");
+        signal::kill(pid, Signal::SIGTERM)
+            .unwrap_or_else(|e| panic!("SIGTERM {name} pid {pid}: {e}"));
+    }
+    wait_for_comm_exit("/proc", name, STOP_TIMEOUT);
+}
+
+/// Scan /proc for all processes whose comm matches `name` (first 15 chars,
+/// matching TASK_COMM_LEN). Returns all matching PIDs.
+fn find_pids_by_comm_from(proc_path: &str, name: &str) -> Vec<Pid> {
+    let Ok(entries) = fs::read_dir(proc_path) else {
+        return Vec::new();
+    };
+    let mut pids = Vec::new();
+    for entry in entries.flatten() {
+        let fname = entry.file_name();
+        let Some(pid_str) = fname.to_str() else {
+            continue;
+        };
+        if pid_str.chars().next().map_or(true, |c| !c.is_ascii_digit()) {
+            continue;
+        }
+        let comm_path = entry.path().join("comm");
+        if let Ok(comm) = fs::read_to_string(&comm_path) {
+            if comm.trim() == name {
+                if let Ok(pid) = pid_str.parse::<i32>() {
+                    pids.push(Pid::from_raw(pid));
+                }
+            }
+        }
+    }
+    pids
+}
+
+/// Poll /proc until no process with the given comm name exists.
+/// Reaps zombies via waitpid(WNOHANG) since we are PID 1 — without
+/// reaping, zombies retain their /proc/<PID>/comm entry forever.
+fn wait_for_comm_exit(proc_path: &str, name: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if signal::kill(pid, None).is_err() {
+        syslog::try_poll();
+        // Reap any zombie children so /proc entries disappear
+        while let Ok(status) = waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
+            if status == nix::sys::wait::WaitStatus::StillAlive {
+                break;
+            }
+            debug!("reaped {status:?}");
+        }
+        let pids = find_pids_by_comm_from(proc_path, name);
+        if pids.is_empty() {
             return;
+        }
+        for pid in &pids {
+            debug!("waiting for {name} (pid {pid}) to exit");
         }
         std::thread::sleep(POLL_INTERVAL);
     }
-    panic!("pid {pid} did not exit within {}s", timeout.as_secs());
+    panic!("{name} did not exit within {}s", timeout.as_secs());
 }
 
 const FM_CONFIG: &str = "/usr/share/nvidia/nvswitch/fabricmanager.cfg";
@@ -99,20 +142,17 @@ impl NVRC {
         self.track_daemon("nvidia-persistenced", child);
     }
 
-    /// Stop nvidia-persistenced by reading its PID from the pidfile,
-    /// sending SIGTERM for graceful shutdown, and waiting for exit.
-    /// nvidia-persistenced double-forks so the Child handle is unreliable.
+    /// Stop nvidia-persistenced by finding it via /proc/<PID>/comm,
+    /// sending SIGTERM, and polling until gone.
     pub fn stop_persistenced(&mut self) {
-        debug!("Stopping nvidia-persistenced via {}", PERSISTENCED_PID_FILE);
-        stop_daemon_from_pidfile(PERSISTENCED_PID_FILE);
+        stop_daemon_by_comm(PERSISTENCED_COMM);
         self.children.retain(|(n, _)| n != "nvidia-persistenced");
     }
 
-    /// Stop nv-fabricmanager by reading its PID from the pidfile,
-    /// sending SIGTERM for graceful shutdown, and waiting for exit.
+    /// Stop nv-fabricmanager by finding it via /proc/<PID>/comm,
+    /// sending SIGTERM, and polling until gone.
     pub fn stop_fabricmanager(&mut self) {
-        debug!("Stopping nv-fabricmanager via {}", FM_PID_FILE);
-        stop_daemon_from_pidfile(FM_PID_FILE);
+        stop_daemon_by_comm(FM_COMM);
         self.children.retain(|(n, _)| n != "nv-fabricmanager");
     }
 
@@ -489,48 +529,83 @@ mod tests {
         assert!(content.contains("PARTITION_RAIL_POLICY=symmetric"));
     }
 
-    // === stop_daemon_from_pidfile tests ===
+    // === find_pids_by_comm / wait_for_comm_exit tests ===
 
     #[test]
-    fn test_stop_daemon_from_pidfile() {
-        use std::io::Write;
-        use tempfile::NamedTempFile;
-
-        let child = std::process::Command::new("/bin/sleep")
-            .arg("60")
-            .spawn()
-            .unwrap();
-        let pid = child.id();
-
-        let mut pidfile = NamedTempFile::new().unwrap();
-        write!(pidfile, "{pid}").unwrap();
-
-        stop_daemon_from_pidfile(pidfile.path().to_str().unwrap());
-
-        // Process should be gone after SIGTERM + waitpid
-        let result = signal::kill(Pid::from_raw(pid as i32), None);
-        assert!(result.is_err()); // ESRCH: no such process
+    fn test_find_pids_by_comm_not_found() {
+        let pids = find_pids_by_comm_from("/proc", "nonexistent-xyz");
+        assert!(pids.is_empty());
     }
 
     #[test]
-    fn test_stop_daemon_from_pidfile_missing() {
+    fn test_find_pids_by_comm_bad_path() {
+        let pids = find_pids_by_comm_from("/nonexistent", "anything");
+        assert!(pids.is_empty());
+    }
+
+    #[test]
+    fn test_find_pids_by_comm_fake_proc() {
+        let tmpdir = TempDir::new().unwrap();
+        let pid_dir = tmpdir.path().join("42");
+        fs::create_dir_all(&pid_dir).unwrap();
+        fs::write(pid_dir.join("comm"), "test-daemon\n").unwrap();
+
+        let pids = find_pids_by_comm_from(tmpdir.path().to_str().unwrap(), "test-daemon");
+        assert_eq!(pids, vec![Pid::from_raw(42)]);
+    }
+
+    #[test]
+    fn test_find_pids_by_comm_multiple() {
+        let tmpdir = TempDir::new().unwrap();
+        for pid in [10, 20, 30] {
+            let pid_dir = tmpdir.path().join(pid.to_string());
+            fs::create_dir_all(&pid_dir).unwrap();
+            fs::write(pid_dir.join("comm"), "test-daemon\n").unwrap();
+        }
+        // Different daemon should not match
+        let other = tmpdir.path().join("40");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("comm"), "other-daemon\n").unwrap();
+
+        let pids = find_pids_by_comm_from(tmpdir.path().to_str().unwrap(), "test-daemon");
+        assert_eq!(pids.len(), 3);
+    }
+
+    #[test]
+    fn test_find_pids_by_comm_skips_non_numeric() {
+        let tmpdir = TempDir::new().unwrap();
+        let non_pid = tmpdir.path().join("self");
+        fs::create_dir_all(&non_pid).unwrap();
+        fs::write(non_pid.join("comm"), "test-daemon\n").unwrap();
+
+        let pids = find_pids_by_comm_from(tmpdir.path().to_str().unwrap(), "test-daemon");
+        assert!(pids.is_empty());
+    }
+
+    #[test]
+    fn test_wait_for_comm_exit_already_gone() {
+        let tmpdir = TempDir::new().unwrap();
+        // Empty proc dir — no process found, returns immediately
+        wait_for_comm_exit(
+            tmpdir.path().to_str().unwrap(),
+            "nonexistent",
+            Duration::from_secs(1),
+        );
+    }
+
+    #[test]
+    fn test_wait_for_comm_exit_timeout() {
         use std::panic;
+
+        // Create a fake proc entry that never goes away
+        let tmpdir = TempDir::new().unwrap();
+        let pid_dir = tmpdir.path().join("99");
+        fs::create_dir_all(&pid_dir).unwrap();
+        fs::write(pid_dir.join("comm"), "stuck-daemon\n").unwrap();
+
+        let path = tmpdir.path().to_str().unwrap().to_string();
         let result = panic::catch_unwind(|| {
-            stop_daemon_from_pidfile("/nonexistent/pidfile");
-        });
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_stop_daemon_from_pidfile_invalid_pid() {
-        use std::io::Write;
-        use tempfile::NamedTempFile;
-
-        let mut pidfile = NamedTempFile::new().unwrap();
-        write!(pidfile, "not_a_number").unwrap();
-
-        let result = std::panic::catch_unwind(|| {
-            stop_daemon_from_pidfile(pidfile.path().to_str().unwrap());
+            wait_for_comm_exit(&path, "stuck-daemon", Duration::from_millis(200));
         });
         assert!(result.is_err());
     }
@@ -546,8 +621,6 @@ mod tests {
         nvrc.track_daemon("other-daemon", child2);
         assert_eq!(nvrc.children.len(), 2);
 
-        // We can't call stop_persistenced() directly because it reads from
-        // the real pidfile path. Test the retain logic instead.
         nvrc.children.retain(|(n, _)| n != "nvidia-persistenced");
         assert_eq!(nvrc.children.len(), 1);
         assert_eq!(nvrc.children[0].0, "other-daemon");
