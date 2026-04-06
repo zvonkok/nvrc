@@ -23,21 +23,20 @@ recovery mechanisms—if GPU initialization fails, the VM powers off. This
 ```mermaid
 flowchart TD
     Start([NVRC starts as PID 1]) --> PanicHook[Set panic hook<br/>power off VM on panic]
-    PanicHook --> MountFS[Mount filesystems<br/>/proc /dev /sys /run /tmp]
+    PanicHook --> MountFS[Mount filesystems]
     MountFS --> LoopbackUp[Bring up loopback interface]
     LoopbackUp --> InitKernlog[Initialize kernel logging]
-    InitKernlog --> PollSyslogOnce[Poll syslog once]
-    PollSyslogOnce --> ParseKernel[Parse kernel parameters<br/>/proc/cmdline]
+    InitKernlog --> ParseKernel[Parse kernel parameters<br/>/proc/cmdline]
     
-    ParseKernel --> DetectMode[Detect mode]
+    ParseKernel --> DetectMode[Detect mode<br/>scan /sys/bus/pci/devices]
     DetectMode --> ModeSelect{Mode?}
     
-    ModeSelect -->|gpu default| GPUMode[GPU Mode]
+    ModeSelect -->|gpu| GPUMode[GPU Mode]
     ModeSelect -->|cpu| CPUMode[CPU Mode]
     ModeSelect -->|servicevm-nvl4| NVL4Mode[ServiceVM NVL4<br/>H100/H200/H800]
     ModeSelect -->|servicevm-nvl5| NVL5Mode[ServiceVM NVL5<br/>B100/B200/B300]
     
-    GPUMode --> GPUSteps[• Load nvidia.ko nvidia-uvm<br/>• Start nvidia-persistenced<br/>• nvidia-smi: lmc lgc pl srs<br/>• nv-hostengine dcgm-exporter<br/>• Generate CDI spec<br/>• Health checks]
+    GPUMode --> GPUSteps[• Load nvidia.ko nvidia-uvm<br/>• Start nvidia-persistenced<br/>• nvidia-smi: lmc lgc pl srs<br/>• nv-hostengine dcgm-exporter if nvrc.dcgm<br/>• Generate CDI spec<br/>• Health checks]
     
     CPUMode --> CPUSteps[• Skip GPU initialization]
     
@@ -64,15 +63,29 @@ flowchart TD
 
 ## Kernel Parameters
 
-NVRC is configured entirely via kernel command-line parameters (no config
-files). This is critical for minimal init environments where userspace
-configuration doesn't exist yet.
+NVRC is configured via kernel command-line parameters (no config files).
+This is critical for minimal init environments where userspace configuration
+doesn't exist yet.
+
+### Mode Detection
+
+NVRC **auto-detects** the operating mode by scanning `/sys/bus/pci/devices` for
+NVIDIA GPUs, NVSwitches, and Mellanox CX7 bridge devices (NVL5). No kernel
+parameter is needed.
+
+| Mode            | Detection Criteria                                | Hardware                               |
+| --------------- | ------------------------------------------------- | -------------------------------------- |
+| `cpu`           | No NVIDIA devices found                           | CPU-only VM                            |
+| `gpu`           | GPUs present, no NVSwitch/CX7                     | Standard GPU passthrough               |
+| `gpu` (NVL4)    | 8 GPUs + 4 NVSwitches                             | Bare metal HGX H100/H200/H800          |
+| `gpu` (NVL5)    | 8 GPUs + 4 CX7 SW_MNG devices                     | Bare metal HGX B200/B300/B100          |
+| `servicevm-nvl4`| 4 NVSwitches, no GPUs                             | Service VM for H100/H200/H800          |
+| `servicevm-nvl5`| 4 CX7 SW_MNG devices, no GPUs/NVSwitches          | Service VM for B200/B300/B100          |
 
 ### Core Parameters
 
 | Parameter   | Values                                           | Default | Description                                                                                                                         |
 | ----------- | ------------------------------------------------ | ------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `nvrc.mode` | `gpu`, `cpu`, `nvswitch-nvl4`, `nvswitch-nvl5`   | `gpu`   | Operation mode. `cpu` for CPU-only, `nvswitch-nvl4` for H100/H200/H800 service VMs, `nvswitch-nvl5` for B200/B300/B100 service VMs. |
 | `nvrc.log`  | `off`, `error`, `warn`, `info`, `debug`, `trace` | `off`   | Log verbosity level. Also enables `/proc/sys/kernel/printk_devkmsg`.                                                                |
 
 ### GPU Configuration
@@ -82,7 +95,7 @@ configuration doesn't exist yet.
 | `nvrc.smi.lgc` | `<MHz>`                | -       | Lock GPU core clocks to fixed frequency. Eliminates thermal throttling for consistent performance. |
 | `nvrc.smi.lmc` | `<MHz>`                | -       | Lock memory clocks to fixed frequency. Used alongside lgc for fully deterministic GPU behavior.    |
 | `nvrc.smi.pl`  | `<Watts>`              | -       | Set GPU power limit. Lower values reduce heat/power; higher allows peak performance.               |
-| `nvrc.smi.srs` | `enabled`, `disabled`  | -       | Secure Randomization Seed for GPU memory (passed to nvidia-smi).                                   |
+| `nvrc.smi.srs` | `0`, `1`               | -       | Set GPU Ready State for Confidential Computing. 1=Ready (accept workloads), 0=NotReady.           |
 
 ### Daemon Control
 
@@ -90,51 +103,31 @@ configuration doesn't exist yet.
 | --------------------------- | --------------------------------------- | -------- | -------------------------------------------------------------------------------------------------- |
 | `nvrc.uvm.persistence.mode` | `on/off`, `true/false`, `1/0`, `yes/no` | `true`   | UVM persistence mode keeps unified memory state across CUDA context teardowns.                     |
 | `nvrc.dcgm`                 | `on/off`, `true/false`, `1/0`, `yes/no` | `false`  | Enable DCGM (Data Center GPU Manager) for telemetry and health monitoring.                         |
-| `nvrc.fm.mode`              | `0`, `1`                                | -        | Fabric Manager mode: 0=bare metal, 1=servicevm (shared nvswitch). Auto-set in nvswitch modes.      |
-| `nvrc.fm.rail.policy`       | `greedy`, `symmetric`                   | `greedy` | Partition rail policy. Symmetric required for Confidential Computing on Blackwell.                 |
 
 ### Example Configurations
 
-**Minimal GPU setup (defaults):**
+**Enable debug logging:**
 
 ```text
-nvrc.mode=gpu
-```
-
-**CPU-only mode:**
-
-```text
-nvrc.mode=cpu
-```
-
-**NVSwitch NVL4 mode (Service VM for HGX H100/H200/H800 - NVLink 4.0):**
-
-```text
-nvrc.mode=nvswitch-nvl4
-```
-
-**NVSwitch NVL5 mode (Service VM for HGX B200/B300/B100 - NVLink 5.0):**
-
-```text
-nvrc.mode=nvswitch-nvl5
+nvrc.log=debug
 ```
 
 **GPU with locked clocks for benchmarking:**
 
 ```text
-nvrc.mode=gpu nvrc.smi.lgc=1500 nvrc.smi.lmc=5001 nvrc.smi.pl=300
+nvrc.smi.lgc=1500 nvrc.smi.lmc=5001 nvrc.smi.pl=300
 ```
 
 **GPU with DCGM monitoring:**
 
 ```text
-nvrc.mode=gpu nvrc.dcgm=on nvrc.log=info
+nvrc.dcgm=on nvrc.log=info
 ```
 
-**Multi-GPU with NVLink:**
+**Confidential Computing - Set GPU to Ready State:**
 
 ```text
-nvrc.mode=gpu nvrc.fm.mode=0 nvrc.log=debug
+nvrc.smi.srs=1
 ```
 
 ## Build
