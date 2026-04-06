@@ -24,8 +24,8 @@ recovery mechanisms—if GPU initialization fails, the VM powers off. This
 flowchart TD
     Start([NVRC starts as PID 1]) --> PanicHook[Set panic hook<br/>power off VM on panic]
     PanicHook --> MountFS[Mount filesystems]
-    MountFS --> LoopbackUp[Bring up loopback interface]
-    LoopbackUp --> InitKernlog[Initialize kernel logging]
+    MountFS --> Loopback[Bring up loopback interface]
+    Loopback --> InitKernlog[Initialize kernel logging]
     InitKernlog --> ParseKernel[Parse kernel parameters<br/>/proc/cmdline]
     
     ParseKernel --> DetectMode[Detect mode<br/>scan /sys/bus/pci/devices]

@@ -17,7 +17,7 @@ nix::ioctl_read_bad!(siocgifflags, libc::SIOCGIFFLAGS, libc::ifreq);
 nix::ioctl_write_ptr_bad!(siocsifflags, libc::SIOCSIFFLAGS, libc::ifreq);
 
 /// Bring up the loopback interface (`lo`).
-pub fn loopback_up() {
+pub fn loopback() {
     let fd = Errno::result(unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) })
         .or_panic(format_args!("socket for loopback ioctl"));
 
@@ -44,20 +44,20 @@ mod tests {
     fn test_loopback_up() {
         require_root();
         // lo is already up on a normal system, calling again is idempotent
-        loopback_up();
+        loopback();
     }
 
     #[test]
     fn test_loopback_up_idempotent() {
         require_root();
-        loopback_up();
-        loopback_up();
+        loopback();
+        loopback();
     }
 
     #[test]
     fn test_loopback_up_verifies_flags() {
         require_root();
-        loopback_up();
+        loopback();
 
         let fd = Errno::result(unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) })
             .expect("socket");

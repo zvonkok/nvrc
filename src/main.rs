@@ -95,9 +95,8 @@ fn main() {
     lockdown::set_panic_hook();
     let mut init = NVRC::default();
     mount::setup();
-    net::loopback_up();
+    net::loopback();
     kmsg::kernlog_setup();
-    syslog::poll();
     init.process_kernel_params(None);
 
     let detected = mode::detect();
